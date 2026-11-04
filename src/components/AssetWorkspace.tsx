@@ -29,6 +29,7 @@ import {
   getAssetLibrary,
   getScreenplay,
   getStoryboards,
+  queueAssetBatchPlan,
   saveAssetLibrary,
   setPrimaryAssetReferenceImage,
 } from "../lib/api";
@@ -127,6 +128,7 @@ export function AssetWorkspace({
   const [batchReviewedIds, setBatchReviewedIds] = useState<string[]>([]);
   const [batchAcknowledged, setBatchAcknowledged] = useState(false);
   const [batchSaving, setBatchSaving] = useState(false);
+  const [batchQueueing, setBatchQueueing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -429,6 +431,21 @@ export function AssetWorkspace({
       setError(batchError instanceof Error ? batchError.message : "批量生产清单保存失败");
     } finally {
       setBatchSaving(false);
+    }
+  };
+
+  const handleQueueBatchPlan = async () => {
+    if (!project || !batchSelectionMatchesPlan || !batchAcknowledged) return;
+    setBatchQueueing(true);
+    setError(null);
+    try {
+      await queueAssetBatchPlan(project.id);
+      setBatchAcknowledged(false);
+      setBatchOpen(false);
+    } catch (queueError) {
+      setError(queueError instanceof Error ? queueError.message : "生成队列创建失败");
+    } finally {
+      setBatchQueueing(false);
     }
   };
 
@@ -975,13 +992,17 @@ export function AssetWorkspace({
                         disabled={!allSelectedReviewed}
                         onChange={(event) => setBatchAcknowledged(event.target.checked)}
                       />
-                      我已逐项审查以上提示词，并确认后续排队将消耗 {selectedBatchItems.length} 次图像生成额度。
+                      {batchSelectionMatchesPlan
+                        ? `我确认现在开始执行 ${selectedBatchItems.length} 项生图任务，预计消耗 ${selectedBatchItems.length} 次图像生成额度。`
+                        : `我已逐项审查以上提示词，并确认后续排队将消耗 ${selectedBatchItems.length} 次图像生成额度。`}
                     </label>
                     <small>
                       {selectedBatchItems.length === 0
                         ? "请至少选择一项已确认资产。"
                         : allSelectedReviewed
-                          ? "审查已完成，可以保存生产清单。"
+                          ? batchSelectionMatchesPlan
+                            ? "清单已保存；点击开始后任务会按顺序执行，并可在任务中心查看。"
+                            : "审查已完成，可以保存生产清单。"
                           : `还有 ${selectedBatchItems.filter((item) => !reviewedSet.has(item.id)).length} 项提示词未标记审查。`}
                     </small>
                     {error ? <span className="asset-batch-error">{error}</span> : null}
@@ -994,11 +1015,19 @@ export function AssetWorkspace({
                       <button
                         className="button primary compact"
                         type="button"
-                        disabled={!batchAcknowledged || !allSelectedReviewed || batchSaving}
-                        onClick={handleConfirmBatchPlan}
+                        disabled={!batchAcknowledged || !allSelectedReviewed || batchSaving || batchQueueing}
+                        onClick={batchSelectionMatchesPlan ? handleQueueBatchPlan : handleConfirmBatchPlan}
                       >
-                        {batchSaving ? <LoaderCircle className="spinning" size={15} /> : <ShieldCheck size={15} />}
-                        {batchSaving ? "正在保存…" : "确认清单（暂不生成）"}
+                        {batchSaving || batchQueueing
+                          ? <LoaderCircle className="spinning" size={15} />
+                          : batchSelectionMatchesPlan ? <Sparkles size={15} /> : <ShieldCheck size={15} />}
+                        {batchQueueing
+                          ? "正在创建队列…"
+                          : batchSaving
+                            ? "正在保存…"
+                            : batchSelectionMatchesPlan
+                              ? `开始批量生成（消耗 ${selectedBatchItems.length} 次额度）`
+                              : "确认清单（暂不生成）"}
                       </button>
                     )}
                   </div>

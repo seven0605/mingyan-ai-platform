@@ -1,16 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  AlertCircle,
   ArrowLeft,
   CheckCircle2,
   Clock3,
   FolderKanban,
   Image as ImageIcon,
   LoaderCircle,
+  PauseCircle,
   RefreshCw,
+  RotateCcw,
   Video,
   X,
 } from "lucide-react";
-import { getProjectTasks } from "../lib/api";
+import { getProjectTasks, resumeProjectTasks, retryProjectTask } from "../lib/api";
 import type { Project, ProjectTask } from "../types";
 
 interface TaskCenterProps {
@@ -25,6 +28,14 @@ const ASSET_KIND_LABEL = {
   character: "角色",
   scene: "场景",
   prop: "物品",
+} as const;
+
+const TASK_STATUS_META = {
+  queued: { label: "排队中", icon: Clock3 },
+  running: { label: "生成中", icon: LoaderCircle },
+  completed: { label: "已完成", icon: CheckCircle2 },
+  failed: { label: "失败", icon: AlertCircle },
+  interrupted: { label: "可恢复", icon: PauseCircle },
 } as const;
 
 function formatTaskTime(value: string) {
@@ -42,26 +53,35 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [previewTask, setPreviewTask] = useState<ProjectTask | null>(null);
+  const [actingId, setActingId] = useState<string | null>(null);
 
-  const loadTasks = async () => {
+  const loadTasks = async (quiet = false) => {
     if (!project) {
       setTasks([]);
       return;
     }
-    setLoading(true);
+    if (!quiet) setLoading(true);
     setError(null);
     try {
       setTasks(await getProjectTasks(project.id));
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "任务记录读取失败");
     } finally {
-      setLoading(false);
+      if (!quiet) setLoading(false);
     }
   };
 
   useEffect(() => {
     void loadTasks();
   }, [project?.id]);
+
+  const hasActiveTasks = tasks.some((task) => task.status === "queued" || task.status === "running");
+
+  useEffect(() => {
+    if (!project || !hasActiveTasks) return;
+    const timer = window.setInterval(() => void loadTasks(true), 2000);
+    return () => window.clearInterval(timer);
+  }, [project?.id, hasActiveTasks]);
 
   const filteredTasks = useMemo(() => {
     if (filter === "video") return [];
@@ -71,6 +91,35 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
   const completedCount = tasks.filter((task) => task.status === "completed").length;
   const activeCount = tasks.filter((task) => task.status === "queued" || task.status === "running").length;
   const failedCount = tasks.filter((task) => task.status === "failed").length;
+  const interruptedCount = tasks.filter((task) => task.status === "interrupted").length;
+
+  const handleRetry = async (task: ProjectTask) => {
+    if (!project) return;
+    setActingId(task.id);
+    setError(null);
+    try {
+      await retryProjectTask(project.id, task.id);
+      await loadTasks(true);
+    } catch (retryError) {
+      setError(retryError instanceof Error ? retryError.message : "任务重试失败");
+    } finally {
+      setActingId(null);
+    }
+  };
+
+  const handleResume = async () => {
+    if (!project) return;
+    setActingId("resume");
+    setError(null);
+    try {
+      await resumeProjectTasks(project.id);
+      await loadTasks(true);
+    } catch (resumeError) {
+      setError(resumeError instanceof Error ? resumeError.message : "队列恢复失败");
+    } finally {
+      setActingId(null);
+    }
+  };
 
   return (
     <main className="task-page">
@@ -82,10 +131,18 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
           <h1>任务中心</h1>
           <p>集中查看图像与视频生成记录；刷新和预览不会调用模型或消耗额度。</p>
         </div>
-        <button className="button secondary compact" type="button" onClick={loadTasks} disabled={!project || loading}>
-          <RefreshCw className={loading ? "spinning" : ""} size={15} />
-          {loading ? "正在刷新…" : "刷新记录"}
-        </button>
+        <div className="task-heading-actions">
+          {interruptedCount ? (
+            <button className="button primary compact" type="button" onClick={handleResume} disabled={actingId !== null}>
+              {actingId === "resume" ? <LoaderCircle className="spinning" size={15} /> : <RotateCcw size={15} />}
+              恢复队列（可能消耗额度）
+            </button>
+          ) : null}
+          <button className="button secondary compact" type="button" onClick={() => void loadTasks()} disabled={!project || loading}>
+            <RefreshCw className={loading ? "spinning" : ""} size={15} />
+            {loading ? "正在刷新…" : "刷新记录"}
+          </button>
+        </div>
       </header>
 
       {!project ? (
@@ -100,7 +157,7 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
             <div><span>全部任务</span><strong>{tasks.length}</strong></div>
             <div><span>已完成</span><strong>{completedCount}</strong></div>
             <div><span>执行中</span><strong>{activeCount}</strong></div>
-            <div><span>失败</span><strong>{failedCount}</strong></div>
+            <div><span>需处理</span><strong>{failedCount + interruptedCount}</strong></div>
           </section>
 
           <section className="task-board">
@@ -124,18 +181,37 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
                 <div className="task-list-head" role="row">
                   <span>任务</span><span>状态</span><span>模型 / 任务号</span><span>创建时间</span><span>结果</span>
                 </div>
-                {filteredTasks.map((task) => (
+                {filteredTasks.map((task) => {
+                  const statusMeta = TASK_STATUS_META[task.status];
+                  const StatusIcon = statusMeta.icon;
+                  return (
                   <article className="task-row" role="row" key={task.id}>
                     <div className="task-name-cell">
                       <span className="task-type-icon"><ImageIcon size={17} /></span>
-                      <div><strong>{task.title}</strong><span>{ASSET_KIND_LABEL[task.assetKind]}资产 · 图像生成</span></div>
+                      <div>
+                        <strong>{task.title}</strong>
+                        <span>{ASSET_KIND_LABEL[task.assetKind]}资产 · 第 {task.attemptCount} 次执行</span>
+                        {task.error ? <small>{task.error}</small> : null}
+                      </div>
                     </div>
-                    <span className="task-status completed"><CheckCircle2 size={14} /> 已完成</span>
+                    <span className={`task-status ${task.status}`}>
+                      <StatusIcon className={task.status === "running" ? "spinning" : ""} size={14} />
+                      {statusMeta.label}
+                    </span>
                     <div className="task-model-cell"><strong>{task.model}</strong><span>{task.providerTaskId || "无服务商任务号"}</span></div>
                     <span className="task-time"><Clock3 size={13} /> {formatTaskTime(task.createdAt)}</span>
-                    <button className="task-preview-button" type="button" onClick={() => setPreviewTask(task)}>查看结果</button>
+                    {task.status === "completed" && task.resultUrl ? (
+                      <button className="task-preview-button" type="button" onClick={() => setPreviewTask(task)}>查看结果</button>
+                    ) : task.status === "failed" ? (
+                      <button className="task-preview-button retry" type="button" disabled={actingId !== null} onClick={() => handleRetry(task)}>
+                        {actingId === task.id ? "重试中…" : "重试（消耗额度）"}
+                      </button>
+                    ) : (
+                      <span className="task-no-result">—</span>
+                    )}
                   </article>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="task-empty compact">

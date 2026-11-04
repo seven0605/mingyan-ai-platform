@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import sqlite3
 
 import httpx
 from fastapi.testclient import TestClient
@@ -726,7 +727,11 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             "model": "tt-image-2.5",
             "resultUrl": generated_image["url"],
             "cost": 0.23,
+            "batchId": "",
+            "error": "",
+            "attemptCount": 1,
             "createdAt": generated_image["createdAt"],
+            "updatedAt": generated_image["createdAt"],
         }
         local_image = client.get(generated_image["url"])
         assert local_image.status_code == 200
@@ -873,3 +878,205 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         image_settings = client.get("/api/settings/image-model").json()
         assert image_settings["configured"] is True
         assert image_settings["model"] == "tt-image-2.5"
+
+
+def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
+    credentials = MemoryCredentialStore()
+    created_prompts: list[str] = []
+    retry_enabled = False
+
+    def model_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal retry_enabled
+        if request.url.host == "cdn.example.com":
+            return httpx.Response(
+                200,
+                content=b"\x89PNG\r\n\x1a\n",
+                headers={"content-type": "image/png"},
+            )
+        if request.url.path == "/v1/media/generate":
+            payload = json.loads(request.content)
+            created_prompts.append(payload["prompt"])
+            return httpx.Response(
+                200,
+                json={"data": {"task_id": f"queue-task-{len(created_prompts)}"}},
+            )
+        if request.url.path == "/v1/media/status":
+            task_id = request.url.params["task_id"]
+            if task_id == "queue-task-2" and not retry_enabled:
+                return httpx.Response(
+                    200,
+                    json={
+                        "task_id": task_id,
+                        "state": "failed",
+                        "is_final": True,
+                        "result_url": "",
+                        "error": "模拟第二项失败",
+                        "cost": 0,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "task_id": task_id,
+                    "state": "success",
+                    "is_final": True,
+                    "result_url": f"https://cdn.example.com/{task_id}.png",
+                    "error": "",
+                    "cost": 0.12,
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    transport = httpx.MockTransport(model_handler)
+    first_asset_id = "00000000-0000-4000-8000-000000000001"
+    second_asset_id = "00000000-0000-4000-8000-000000000002"
+    with TestClient(
+        create_app(
+            data_dir=tmp_path,
+            static_dir=Path("missing"),
+            credential_store=credentials,
+            model_transport=transport,
+        )
+    ) as client:
+        client.put(
+            "/api/settings/image-model",
+            json={
+                "baseUrl": "https://example.com/v1",
+                "model": "tt-image-2.5",
+                "apiKey": "queue-image-secret",
+            },
+        )
+        project = client.post(
+            "/api/projects", json={"name": "队列测试", "description": ""}
+        ).json()
+        now = "2026-11-04T00:00:00+00:00"
+        assets = [
+            {
+                "id": first_asset_id,
+                "kind": "character",
+                "name": "角色甲",
+                "status": "confirmed",
+                "referencePrompt": "角色甲完整提示词",
+            },
+            {
+                "id": second_asset_id,
+                "kind": "scene",
+                "name": "场景乙",
+                "status": "confirmed",
+                "referencePrompt": "场景乙完整提示词",
+            },
+        ]
+        plan = {
+            "items": [
+                {
+                    "assetId": first_asset_id,
+                    "assetKind": "character",
+                    "name": "角色甲",
+                    "prompt": "角色甲完整提示词",
+                    "aspectRatio": "3:4",
+                    "existingVersionCount": 0,
+                },
+                {
+                    "assetId": second_asset_id,
+                    "assetKind": "scene",
+                    "name": "场景乙",
+                    "prompt": "场景乙完整提示词",
+                    "aspectRatio": "16:9",
+                    "existingVersionCount": 0,
+                },
+            ],
+            "estimatedUnitCost": None,
+            "estimatedTotalCost": None,
+            "costSampleCount": 0,
+            "assetLibraryUpdatedAt": now,
+            "confirmedAt": now,
+        }
+        with sqlite3.connect(tmp_path / "mingyan.sqlite3") as connection:
+            connection.execute(
+                """
+                INSERT INTO project_assets (
+                    project_id, payload, screenplay_updated_at,
+                    storyboard_updated_at, updated_at
+                ) VALUES (?, ?, ?, NULL, ?)
+                """,
+                (project["id"], json.dumps({"items": assets}), now, now),
+            )
+            connection.execute(
+                "INSERT INTO asset_batch_plans (project_id, payload, updated_at) VALUES (?, ?, ?)",
+                (project["id"], json.dumps(plan), now),
+            )
+
+        queued = client.post(f"/api/projects/{project['id']}/assets/batch-plan/queue")
+        assert queued.status_code == 200
+        assert [item["status"] for item in queued.json()] == ["queued", "queued"]
+        assert created_prompts == ["角色甲完整提示词", "场景乙完整提示词"]
+
+        tasks = client.get(f"/api/projects/{project['id']}/tasks").json()
+        assert {task["status"] for task in tasks} == {"completed", "failed"}
+        failed_task = next(task for task in tasks if task["status"] == "failed")
+        assert failed_task["error"] == "模拟第二项失败"
+        library = client.get(f"/api/projects/{project['id']}/assets").json()
+        assert len(library["items"][0]["referenceImages"]) == 1
+        assert library["items"][1]["referenceImages"] == []
+
+        retry_enabled = True
+        retried = client.post(
+            f"/api/projects/{project['id']}/tasks/{failed_task['id']}/retry"
+        )
+        assert retried.status_code == 200
+        tasks = client.get(f"/api/projects/{project['id']}/tasks").json()
+        retried_task = next(task for task in tasks if task["id"] == failed_task["id"])
+        assert retried_task["status"] == "completed"
+        assert retried_task["attemptCount"] == 2
+        library = client.get(f"/api/projects/{project['id']}/assets").json()
+        assert [len(item["referenceImages"]) for item in library["items"]] == [1, 1]
+
+    interrupted_job_id = "00000000-0000-4000-8000-000000000003"
+    with sqlite3.connect(tmp_path / "mingyan.sqlite3") as connection:
+        connection.execute(
+            """
+            INSERT INTO asset_generation_jobs (
+                id, project_id, batch_id, asset_id, asset_kind, title,
+                prompt, aspect_ratio, model, status, provider_task_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'character', '角色甲参考图 V2', ?, '3:4',
+                      'tt-image-2.5', 'running', 'provider-task-existing', ?, ?)
+            """,
+            (
+                interrupted_job_id,
+                project["id"],
+                "00000000-0000-4000-8000-000000000004",
+                first_asset_id,
+                "角色甲完整提示词",
+                now,
+                now,
+            ),
+        )
+
+    create_count_before_resume = len(created_prompts)
+    with TestClient(
+        create_app(
+            data_dir=tmp_path,
+            static_dir=Path("missing"),
+            credential_store=credentials,
+            model_transport=transport,
+        )
+    ) as client:
+        interrupted = next(
+            task
+            for task in client.get(f"/api/projects/{project['id']}/tasks").json()
+            if task["id"] == interrupted_job_id
+        )
+        assert interrupted["status"] == "interrupted"
+        resumed = client.post(f"/api/projects/{project['id']}/tasks/resume")
+        assert resumed.status_code == 200
+        assert len(created_prompts) == create_count_before_resume
+        resumed_task = next(
+            task
+            for task in client.get(f"/api/projects/{project['id']}/tasks").json()
+            if task["id"] == interrupted_job_id
+        )
+        assert resumed_task["status"] == "completed"
+        assert resumed_task["providerTaskId"] == "provider-task-existing"
+        library = client.get(f"/api/projects/{project['id']}/assets").json()
+        assert [len(item["referenceImages"]) for item in library["items"]] == [2, 1]

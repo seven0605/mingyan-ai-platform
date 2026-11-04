@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from keyring.errors import KeyringError
 from fastapi.staticfiles import StaticFiles
@@ -442,7 +442,7 @@ class ProjectTaskOut(BaseModel):
     id: str
     projectId: str
     type: Literal["asset-image"]
-    status: Literal["queued", "running", "completed", "failed"]
+    status: Literal["queued", "running", "completed", "failed", "interrupted"]
     title: str
     assetId: str
     assetKind: Literal["character", "scene", "prop"]
@@ -450,7 +450,11 @@ class ProjectTaskOut(BaseModel):
     model: str
     resultUrl: str
     cost: float | None = None
+    batchId: str = ""
+    error: str = ""
+    attemptCount: int = 1
     createdAt: str
+    updatedAt: str
 
 
 def utc_now() -> str:
@@ -575,6 +579,30 @@ def initialize_database(database_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS asset_batch_plans (
                 project_id TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS asset_generation_jobs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                asset_kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                aspect_ratio TEXT NOT NULL,
+                model TEXT NOT NULL,
+                status TEXT NOT NULL,
+                provider_task_id TEXT NOT NULL DEFAULT '',
+                result_url TEXT NOT NULL DEFAULT '',
+                cost REAL,
+                error TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
             )
@@ -707,11 +735,33 @@ def asset_library_tasks(row: sqlite3.Row) -> list[ProjectTaskOut]:
             resultUrl=image.url,
             cost=image.cost,
             createdAt=image.createdAt,
+            updatedAt=image.createdAt,
         )
         for item in library.items
         for index, image in enumerate(item.referenceImages)
     ]
     return sorted(tasks, key=lambda task: task.createdAt, reverse=True)
+
+
+def row_to_generation_task(row: sqlite3.Row) -> ProjectTaskOut:
+    return ProjectTaskOut(
+        id=row["id"],
+        projectId=row["project_id"],
+        type="asset-image",
+        status=row["status"],
+        title=row["title"],
+        assetId=row["asset_id"],
+        assetKind=row["asset_kind"],
+        providerTaskId=row["provider_task_id"],
+        model=row["model"],
+        resultUrl=row["result_url"],
+        cost=row["cost"],
+        batchId=row["batch_id"],
+        error=row["error"],
+        attemptCount=row["attempt_count"],
+        createdAt=row["created_at"],
+        updatedAt=row["updated_at"],
+    )
 
 
 def unique_strings(values: list[str]) -> list[str]:
@@ -1164,6 +1214,17 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         initialize_database(database_path)
+        with connect(database_path) as connection:
+            connection.execute(
+                """
+                UPDATE asset_generation_jobs
+                SET status = 'interrupted',
+                    error = '本地服务曾在队列执行期间停止；已有服务商任务号时将复用原任务。',
+                    updated_at = ?
+                WHERE status IN ('queued', 'running')
+                """,
+                (utc_now(),),
+            )
         yield
 
     application = FastAPI(title="明琰AI平台本地服务", version="0.1.0", lifespan=lifespan)
@@ -1243,6 +1304,247 @@ def create_app(
         if not api_key:
             raise HTTPException(status_code=409, detail="系统凭据库中没有找到图像 API 密钥")
         return settings, api_key
+
+    def process_generation_job(job_id: str) -> None:
+        with connect(database_path) as connection:
+            job = connection.execute(
+                "SELECT * FROM asset_generation_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if job is None or job["status"] != "running":
+            return
+
+        provider_task_id = job["provider_task_id"]
+        recoverable = bool(provider_task_id)
+        image_path: Path | None = None
+        try:
+            settings, api_key = image_model_credentials()
+            api_root = settings.baseUrl if settings.baseUrl.endswith("/v1") else f"{settings.baseUrl}/v1"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            status_payload: dict = {}
+            with httpx.Client(
+                transport=model_transport, timeout=30, follow_redirects=True
+            ) as client:
+                if not provider_task_id:
+                    created = client.post(
+                        f"{api_root}/media/generate",
+                        headers=headers,
+                        json={
+                            "model": job["model"],
+                            "prompt": job["prompt"],
+                            "params": {
+                                "version": "flare",
+                                "aspect_ratio": job["aspect_ratio"],
+                                "resolution": "1K",
+                                "quality": "auto",
+                                "background": "opaque",
+                            },
+                        },
+                    )
+                    if not created.is_success:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"图像服务创建任务失败（HTTP {created.status_code}）",
+                        )
+                    try:
+                        provider_task_id = str(
+                            created.json().get("data", {}).get("task_id", "")
+                        )
+                    except (TypeError, ValueError) as error:
+                        raise HTTPException(
+                            status_code=502, detail="图像服务返回了无法识别的任务数据"
+                        ) from error
+                    if not provider_task_id:
+                        raise HTTPException(status_code=502, detail="图像服务没有返回任务编号")
+                    recoverable = True
+                    with connect(database_path) as connection:
+                        connection.execute(
+                            """
+                            UPDATE asset_generation_jobs
+                            SET provider_task_id = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (provider_task_id, utc_now(), job_id),
+                        )
+
+                deadline = time.monotonic() + 300
+                while time.monotonic() < deadline:
+                    status_response = client.get(
+                        f"{api_root}/media/status",
+                        headers=headers,
+                        params={"task_id": provider_task_id},
+                    )
+                    if not status_response.is_success:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"图像任务查询失败（HTTP {status_response.status_code}）",
+                        )
+                    try:
+                        status_payload = status_response.json()
+                    except ValueError as error:
+                        raise HTTPException(
+                            status_code=502, detail="图像任务状态无法识别"
+                        ) from error
+                    if status_payload.get("is_final") is True:
+                        break
+                    time.sleep(3)
+                else:
+                    raise HTTPException(status_code=504, detail="图像任务等待超时")
+
+                if status_payload.get("state") != "success":
+                    recoverable = False
+                    raise HTTPException(
+                        status_code=502,
+                        detail=str(status_payload.get("error") or "图像任务生成失败"),
+                    )
+                result_url = str(status_payload.get("result_url", ""))
+                parsed_result_url = urlparse(result_url)
+                if parsed_result_url.scheme not in {"http", "https"} or not parsed_result_url.netloc:
+                    recoverable = False
+                    raise HTTPException(status_code=502, detail="图像任务没有返回有效结果地址")
+                image_response = client.get(result_url)
+                if not image_response.is_success:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"生成成功，但下载参考图失败（HTTP {image_response.status_code}）",
+                    )
+
+            mime_type = image_response.headers.get("content-type", "").split(";", 1)[0]
+            suffix = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+            }.get(mime_type)
+            if suffix is None:
+                recoverable = False
+                raise HTTPException(status_code=502, detail="图像服务返回的文件格式不受支持")
+            if not image_response.content or len(image_response.content) > 30 * 1024 * 1024:
+                recoverable = False
+                raise HTTPException(status_code=502, detail="图像服务返回了空文件或文件过大")
+
+            now = utc_now()
+            image_dir = resolved_data_dir / "generated" / job["project_id"] / job["asset_id"]
+            image_dir.mkdir(parents=True, exist_ok=True)
+            image_path = image_dir / f"{job_id}{suffix}"
+            temporary_path = image_dir / f".{job_id}.tmp"
+            temporary_path.write_bytes(image_response.content)
+            temporary_path.replace(image_path)
+            raw_cost = status_payload.get("cost")
+            cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
+            image = AssetImageVersion(
+                id=job_id,
+                url=f"/api/projects/{job['project_id']}/assets/{job['asset_id']}/images/{job_id}",
+                prompt=job["prompt"],
+                model=job["model"],
+                taskId=provider_task_id,
+                aspectRatio=job["aspect_ratio"],
+                resolution="1K",
+                cost=cost,
+                createdAt=now,
+            )
+            with connect(database_path) as connection:
+                asset_row = connection.execute(
+                    "SELECT * FROM project_assets WHERE project_id = ?",
+                    (job["project_id"],),
+                ).fetchone()
+                if asset_row is None:
+                    raise HTTPException(status_code=404, detail="资产库不存在")
+                library = AssetLibraryPayload.model_validate(json.loads(asset_row["payload"]))
+                if not any(item.id == job["asset_id"] for item in library.items):
+                    raise HTTPException(status_code=404, detail="资产不存在")
+                updated_library = library.model_copy(
+                    update={
+                        "items": [
+                            item.model_copy(
+                                update={"referenceImages": [*item.referenceImages, image]}
+                            )
+                            if item.id == job["asset_id"]
+                            else item
+                            for item in library.items
+                        ]
+                    }
+                )
+                connection.execute(
+                    "UPDATE project_assets SET payload = ?, updated_at = ? WHERE project_id = ?",
+                    (updated_library.model_dump_json(), now, job["project_id"]),
+                )
+                connection.execute(
+                    "UPDATE projects SET updated_at = ? WHERE id = ?",
+                    (now, job["project_id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE asset_generation_jobs
+                    SET status = 'completed', provider_task_id = ?, result_url = ?,
+                        cost = ?, error = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (provider_task_id, image.url, cost, now, job_id),
+                )
+        except (
+            HTTPException,
+            httpx.RequestError,
+            sqlite3.Error,
+            ValidationError,
+            OSError,
+        ) as error:
+            if image_path is not None:
+                image_path.unlink(missing_ok=True)
+            if isinstance(error, HTTPException):
+                message = str(error.detail)
+            elif isinstance(error, httpx.RequestError):
+                message = f"图像服务连接中断：{type(error).__name__}"
+            else:
+                message = str(error) or type(error).__name__
+            status = "interrupted" if recoverable else "failed"
+            with connect(database_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE asset_generation_jobs
+                    SET status = ?, provider_task_id = ?, error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, provider_task_id, message, utc_now(), job_id),
+                )
+
+    def process_generation_batch(batch_id: str) -> None:
+        while True:
+            with connect(database_path) as connection:
+                running = connection.execute(
+                    """
+                    SELECT id FROM asset_generation_jobs
+                    WHERE batch_id = ? AND status = 'running'
+                    """,
+                    (batch_id,),
+                ).fetchone()
+                if running is not None:
+                    return
+                queued = connection.execute(
+                    """
+                    SELECT id FROM asset_generation_jobs
+                    WHERE batch_id = ? AND status = 'queued'
+                    ORDER BY created_at, id LIMIT 1
+                    """,
+                    (batch_id,),
+                ).fetchone()
+                if queued is None:
+                    return
+                claimed = connection.execute(
+                    """
+                    UPDATE asset_generation_jobs
+                    SET status = 'running', error = '', updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (utc_now(), queued["id"]),
+                )
+            if claimed.rowcount:
+                process_generation_job(queued["id"])
+                with connect(database_path) as connection:
+                    saved = connection.execute(
+                        "SELECT status FROM asset_generation_jobs WHERE id = ?",
+                        (queued["id"],),
+                    ).fetchone()
+                if saved is not None and saved["status"] == "interrupted":
+                    return
 
     @application.get("/api/settings/text-model", response_model=TextModelSettingsOut)
     def get_text_model_settings() -> TextModelSettingsOut:
@@ -2529,6 +2831,88 @@ def create_app(
             ).fetchone()
         return row_to_asset_batch_plan(saved, asset_row["updated_at"])
 
+    @application.post(
+        "/api/projects/{project_id}/assets/batch-plan/queue",
+        response_model=list[ProjectTaskOut],
+    )
+    def queue_asset_batch_plan(
+        project_id: str, background_tasks: BackgroundTasks
+    ) -> list[ProjectTaskOut]:
+        settings, _ = image_model_credentials()
+        with connect(database_path) as connection:
+            asset_row = connection.execute(
+                "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            plan_row = connection.execute(
+                "SELECT * FROM asset_batch_plans WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            active = connection.execute(
+                """
+                SELECT id FROM asset_generation_jobs
+                WHERE project_id = ? AND status IN ('queued', 'running', 'interrupted')
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+        if asset_row is None:
+            raise HTTPException(status_code=404, detail="资产库不存在")
+        if plan_row is None:
+            raise HTTPException(status_code=409, detail="请先确认批量生产清单")
+        plan = row_to_asset_batch_plan(plan_row, asset_row["updated_at"])
+        if not plan.current:
+            raise HTTPException(status_code=409, detail="资产已更新，请重新审查并确认生产清单")
+        if active is not None:
+            raise HTTPException(status_code=409, detail="已有未完成的生成队列，请先处理任务中心中的任务")
+
+        library = AssetLibraryPayload.model_validate(json.loads(asset_row["payload"]))
+        assets_by_id = {item.id: item for item in library.items}
+        for plan_item in plan.items:
+            asset = assets_by_id.get(plan_item.assetId)
+            if (
+                asset is None
+                or asset.status != "confirmed"
+                or asset.referencePrompt != plan_item.prompt
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{plan_item.name} 已发生变化，请重新确认生产清单",
+                )
+
+        batch_id = str(uuid4())
+        with connect(database_path) as connection:
+            for item in plan.items:
+                now = utc_now()
+                connection.execute(
+                    """
+                    INSERT INTO asset_generation_jobs (
+                        id, project_id, batch_id, asset_id, asset_kind, title,
+                        prompt, aspect_ratio, model, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        project_id,
+                        batch_id,
+                        item.assetId,
+                        item.assetKind,
+                        f"{item.name}参考图 V{item.existingVersionCount + 1}",
+                        item.prompt,
+                        item.aspectRatio,
+                        settings.model,
+                        now,
+                        now,
+                    ),
+                )
+            rows = connection.execute(
+                """
+                SELECT * FROM asset_generation_jobs
+                WHERE batch_id = ? ORDER BY created_at, id
+                """,
+                (batch_id,),
+            ).fetchall()
+        background_tasks.add_task(process_generation_batch, batch_id)
+        return [row_to_generation_task(row) for row in rows]
+
     @application.get(
         "/api/projects/{project_id}/tasks", response_model=list[ProjectTaskOut]
     )
@@ -2539,10 +2923,97 @@ def create_app(
             ).fetchone()
             if project is None:
                 raise HTTPException(status_code=404, detail="项目不存在")
-            row = connection.execute(
+            asset_row = connection.execute(
                 "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
             ).fetchone()
-        return asset_library_tasks(row) if row else []
+            job_rows = connection.execute(
+                """
+                SELECT * FROM asset_generation_jobs
+                WHERE project_id = ? ORDER BY created_at DESC
+                """,
+                (project_id,),
+            ).fetchall()
+        jobs = [row_to_generation_task(row) for row in job_rows]
+        job_ids = {task.id for task in jobs}
+        legacy = [
+            task
+            for task in (asset_library_tasks(asset_row) if asset_row else [])
+            if task.id not in job_ids
+        ]
+        return sorted([*jobs, *legacy], key=lambda task: task.createdAt, reverse=True)
+
+    @application.post(
+        "/api/projects/{project_id}/tasks/{task_id}/retry",
+        response_model=ProjectTaskOut,
+    )
+    def retry_generation_task(
+        project_id: str, task_id: str, background_tasks: BackgroundTasks
+    ) -> ProjectTaskOut:
+        with connect(database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM asset_generation_jobs
+                WHERE id = ? AND project_id = ?
+                """,
+                (task_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="生成任务不存在")
+            if row["status"] != "failed":
+                raise HTTPException(status_code=409, detail="只有失败任务可以重新生成")
+            connection.execute(
+                """
+                UPDATE asset_generation_jobs
+                SET status = 'queued', provider_task_id = '', result_url = '',
+                    cost = NULL, error = '', attempt_count = attempt_count + 1,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (utc_now(), task_id),
+            )
+            saved = connection.execute(
+                "SELECT * FROM asset_generation_jobs WHERE id = ?", (task_id,)
+            ).fetchone()
+        background_tasks.add_task(process_generation_batch, row["batch_id"])
+        return row_to_generation_task(saved)
+
+    @application.post(
+        "/api/projects/{project_id}/tasks/resume",
+        response_model=list[ProjectTaskOut],
+    )
+    def resume_generation_tasks(
+        project_id: str, background_tasks: BackgroundTasks
+    ) -> list[ProjectTaskOut]:
+        with connect(database_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM asset_generation_jobs
+                WHERE project_id = ? AND status IN ('queued', 'interrupted')
+                ORDER BY created_at, id
+                """,
+                (project_id,),
+            ).fetchall()
+            if not rows:
+                raise HTTPException(status_code=409, detail="没有可恢复的生成任务")
+            connection.execute(
+                """
+                UPDATE asset_generation_jobs
+                SET status = 'queued', error = '', updated_at = ?
+                WHERE project_id = ? AND status = 'interrupted'
+                """,
+                (utc_now(), project_id),
+            )
+            saved = connection.execute(
+                """
+                SELECT * FROM asset_generation_jobs
+                WHERE project_id = ? AND status = 'queued'
+                ORDER BY created_at, id
+                """,
+                (project_id,),
+            ).fetchall()
+        for batch_id in dict.fromkeys(row["batch_id"] for row in saved):
+            background_tasks.add_task(process_generation_batch, batch_id)
+        return [row_to_generation_task(row) for row in saved]
 
     @application.get(
         "/api/projects/{project_id}/assets/{asset_id}/images/{image_id}"

@@ -225,8 +225,26 @@ export function confirmAssetBatchPlan(projectId: string, assetIds: string[]) {
   });
 }
 
+export function queueAssetBatchPlan(projectId: string) {
+  return request<ProjectTask[]>(`/api/projects/${projectId}/assets/batch-plan/queue`, {
+    method: "POST",
+  });
+}
+
 export function getProjectTasks(projectId: string) {
   return request<ProjectTask[]>(`/api/projects/${projectId}/tasks`);
+}
+
+export function retryProjectTask(projectId: string, taskId: string) {
+  return request<ProjectTask>(`/api/projects/${projectId}/tasks/${taskId}/retry`, {
+    method: "POST",
+  });
+}
+
+export function resumeProjectTasks(projectId: string) {
+  return request<ProjectTask[]>(`/api/projects/${projectId}/tasks/resume`, {
+    method: "POST",
+  });
 }
 
 export function extractAssetLibrary(projectId: string) {

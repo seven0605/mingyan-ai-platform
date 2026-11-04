@@ -325,7 +325,7 @@ export interface AssetBatchPlan {
   updatedAt: string;
 }
 
-export type ProjectTaskStatus = "queued" | "running" | "completed" | "failed";
+export type ProjectTaskStatus = "queued" | "running" | "completed" | "failed" | "interrupted";
 
 export interface ProjectTask {
   id: string;
@@ -339,5 +339,9 @@ export interface ProjectTask {
   model: string;
   resultUrl: string;
   cost: number | null;
+  batchId: string;
+  error: string;
+  attemptCount: number;
   createdAt: string;
+  updatedAt: string;
 }
