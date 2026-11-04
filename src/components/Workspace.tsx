@@ -51,6 +51,7 @@ interface WorkspaceProps {
   onOpenTasks: () => void;
   textModelConfigured: boolean;
   imageModelConfigured: boolean;
+  videoModelConfigured: boolean;
 }
 
 export function Workspace({
@@ -66,6 +67,7 @@ export function Workspace({
   onOpenTasks,
   textModelConfigured,
   imageModelConfigured,
+  videoModelConfigured,
 }: WorkspaceProps) {
   const [latestTask, setLatestTask] = useState<ProjectTask | null>(null);
 
@@ -225,7 +227,7 @@ export function Workspace({
           </div>
           <div className="connection-list">
             {[
-              { label: "视频生成模型", icon: Video, configured: false },
+              { label: "视频生成模型", icon: Video, configured: videoModelConfigured },
               { label: "图像生成模型", icon: Image, configured: imageModelConfigured },
               { label: "文本与剧本模型", icon: Cpu, configured: textModelConfigured },
             ].map(({ label, icon: ConnectionIcon, configured }) => {

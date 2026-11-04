@@ -7,39 +7,49 @@ import {
   KeyRound,
   LockKeyhole,
   Server,
+  Video,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   saveImageModelSettings,
   saveTextModelSettings,
+  saveVideoModelSettings,
   testImageModelConnection,
   testTextModelConnection,
+  testVideoModelConnection,
 } from "../lib/api";
 import type {
   ImageModelSettings,
   TextModelConnection,
   TextModelSettings,
+  VideoModelSettings,
 } from "../types";
 
 interface ApiSettingsProps {
   textSettings: TextModelSettings | null;
   imageSettings: ImageModelSettings | null;
+  videoSettings: VideoModelSettings | null;
   loadError: string | null;
   onTextSettingsChange: (settings: TextModelSettings) => void;
   onImageSettingsChange: (settings: ImageModelSettings) => void;
+  onVideoSettingsChange: (settings: VideoModelSettings) => void;
 }
 
-type SettingsTab = "text" | "image";
+type SettingsTab = "text" | "image" | "video";
 
 const IMAGE_DEFAULT_BASE_URL = "https://api.lk888.ai/v1";
 const IMAGE_DEFAULT_MODEL = "tt-image-2.5";
+const VIDEO_DEFAULT_BASE_URL = "https://shuikule.top/v1";
+const VIDEO_DEFAULT_MODEL = "BD Seedance2.5";
 
 export function ApiSettings({
   textSettings,
   imageSettings,
+  videoSettings,
   loadError,
   onTextSettingsChange,
   onImageSettingsChange,
+  onVideoSettingsChange,
 }: ApiSettingsProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>("image");
   const [baseUrl, setBaseUrl] = useState(IMAGE_DEFAULT_BASE_URL);
@@ -52,8 +62,13 @@ export function ApiSettings({
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<TextModelConnection | null>(null);
 
-  const settings = activeTab === "image" ? imageSettings : textSettings;
+  const settings = activeTab === "image"
+    ? imageSettings
+    : activeTab === "video"
+      ? videoSettings
+      : textSettings;
   const isImage = activeTab === "image";
+  const isVideo = activeTab === "video";
 
   useEffect(() => {
     if (activeTab === "image") {
@@ -61,9 +76,14 @@ export function ApiSettings({
       setModel(imageSettings?.model || IMAGE_DEFAULT_MODEL);
       return;
     }
+    if (activeTab === "video") {
+      setBaseUrl(videoSettings?.baseUrl || VIDEO_DEFAULT_BASE_URL);
+      setModel(videoSettings?.model || VIDEO_DEFAULT_MODEL);
+      return;
+    }
     setBaseUrl(textSettings?.baseUrl || "");
     setModel(textSettings?.model || "");
-  }, [activeTab, imageSettings, textSettings]);
+  }, [activeTab, imageSettings, textSettings, videoSettings]);
 
   const hasUnsavedChanges = Boolean(
     baseUrl.trim() !== settings?.baseUrl || model.trim() !== settings?.model || apiKey.trim(),
@@ -103,6 +123,9 @@ export function ApiSettings({
       if (isImage) {
         onImageSettingsChange(await saveImageModelSettings(input));
         setMessage("图像模型配置已安全保存，可以进行免生图连接测试。");
+      } else if (isVideo) {
+        onVideoSettingsChange(await saveVideoModelSettings(input));
+        setMessage("视频模型配置已安全保存，可以进行免生成连接测试。");
       } else {
         onTextSettingsChange(await saveTextModelSettings(input));
         setMessage("文本模型配置已安全保存，后续文本与剧本任务将使用这个模型。");
@@ -124,7 +147,11 @@ export function ApiSettings({
     setTestResult(null);
     try {
       setTestResult(
-        isImage ? await testImageModelConnection() : await testTextModelConnection(),
+        isImage
+          ? await testImageModelConnection()
+          : isVideo
+            ? await testVideoModelConnection()
+            : await testTextModelConnection(),
       );
     } catch (testError: unknown) {
       setError(testError instanceof Error ? testError.message : "模型连接测试失败");
@@ -138,11 +165,11 @@ export function ApiSettings({
       <header className="settings-heading">
         <div>
           <h1>API 设置</h1>
-          <p>分别管理剧本创作与图像生成服务，所有密钥只保存在本机系统凭据库。</p>
+          <p>分别管理剧本、图像与视频生成服务，所有密钥只保存在本机系统凭据库。</p>
         </div>
         <div className={settings?.configured ? "model-status configured" : "model-status"}>
           {settings?.configured ? <CheckCircle2 size={18} /> : <Server size={18} />}
-          <span>{isImage ? "图像模型" : "文本模型"}{settings?.configured ? "已配置" : "未配置"}</span>
+          <span>{isImage ? "图像模型" : isVideo ? "视频模型" : "文本模型"}{settings?.configured ? "已配置" : "未配置"}</span>
         </div>
       </header>
 
@@ -169,15 +196,25 @@ export function ApiSettings({
           <Image size={18} />
           <span><strong>图像生成模型</strong><small>{imageSettings?.configured ? "已配置" : "未配置"}</small></span>
         </button>
+        <button
+          type="button"
+          className={activeTab === "video" ? "settings-model-tab active" : "settings-model-tab"}
+          role="tab"
+          aria-selected={activeTab === "video"}
+          onClick={() => switchTab("video")}
+        >
+          <Video size={18} />
+          <span><strong>视频生成模型</strong><small>{videoSettings?.configured ? "已配置" : "未配置"}</small></span>
+        </button>
       </div>
 
       <div className="settings-layout">
         <form className="settings-form" onSubmit={save}>
           <div className="settings-section-heading">
-            {isImage ? <Image size={20} /> : <Server size={20} />}
+            {isImage ? <Image size={20} /> : isVideo ? <Video size={20} /> : <Server size={20} />}
             <div>
-              <h2>{isImage ? "不鸣AI · TT Image 2.5" : "OpenAI 兼容文本接口"}</h2>
-              <p>{isImage ? "用于角色、场景与物品参考图；支持后续接入文生图和参考图编辑。" : "用于小说分析、剧本改编和分镜提示词生成。"}</p>
+              <h2>{isImage ? "不鸣AI · TT Image 2.5" : isVideo ? "睡哭了 · BD Seedance2.5" : "OpenAI 兼容文本接口"}</h2>
+              <p>{isImage ? "用于角色、场景与物品参考图；支持后续接入文生图和参考图编辑。" : isVideo ? "用于 720p、4–30 秒的视频生成；正式生成前需准备公网可读的参考素材。" : "用于小说分析、剧本改编和分镜提示词生成。"}</p>
             </div>
           </div>
 
@@ -187,11 +224,11 @@ export function ApiSettings({
               type="url"
               value={baseUrl}
               onChange={(event) => setBaseUrl(event.target.value)}
-              placeholder={isImage ? IMAGE_DEFAULT_BASE_URL : "https://api.example.com/v1"}
+              placeholder={isImage ? IMAGE_DEFAULT_BASE_URL : isVideo ? VIDEO_DEFAULT_BASE_URL : "https://api.example.com/v1"}
               autoComplete="url"
               required
             />
-            <small>{isImage ? "已按不鸣AI接入文档预填，通常无需修改。" : "填写服务商提供的兼容接口根地址。"}</small>
+            <small>{isImage ? "已按不鸣AI接入文档预填，通常无需修改。" : isVideo ? "已按睡哭了接口文档预填，通常无需修改。" : "填写服务商提供的兼容接口根地址。"}</small>
           </label>
 
           <label className="settings-field">
@@ -199,11 +236,11 @@ export function ApiSettings({
             <input
               value={model}
               onChange={(event) => setModel(event.target.value)}
-              placeholder={isImage ? IMAGE_DEFAULT_MODEL : "例如：deepseek-chat"}
+              placeholder={isImage ? IMAGE_DEFAULT_MODEL : isVideo ? VIDEO_DEFAULT_MODEL : "例如：deepseek-chat"}
               autoComplete="off"
               required
             />
-            <small>{isImage ? "已预填 tt-image-2.5，必须与服务商后台显示的 ID 一致。" : "必须与服务商文档中的模型 ID 完全一致。"}</small>
+            <small>{isImage ? "已预填 tt-image-2.5，必须与服务商后台显示的 ID 一致。" : isVideo ? "已预填 BD Seedance2.5；中间空格和大小写必须保持不变。" : "必须与服务商文档中的模型 ID 完全一致。"}</small>
           </label>
 
           <label className="settings-field">
@@ -240,7 +277,7 @@ export function ApiSettings({
           <div className="settings-actions">
             <button className="button secondary" type="button" disabled={!canTest} onClick={testConnection}>
               <Server size={17} />
-              {testing ? "正在测试…" : isImage ? "免生图测试连接" : "测试连接"}
+              {testing ? "正在测试…" : isImage ? "免生图测试连接" : isVideo ? "免生成测试连接" : "测试连接"}
             </button>
             <button className="button primary" type="submit" disabled={!canSave}>
               <KeyRound size={17} />
@@ -253,9 +290,10 @@ export function ApiSettings({
           <div className="credential-note-icon"><LockKeyhole size={23} /></div>
           <h2>密钥保存在系统凭据库</h2>
           <p>macOS 使用钥匙串，Windows 使用凭据管理器。SQLite 只记录接口地址和模型名称。</p>
-          {isImage ? <p className="credential-test-note">连接测试只读取服务商模型列表，不会生成图片，也不会消耗生图额度。</p> : null}
+          {isImage || isVideo ? <p className="credential-test-note">连接测试只读取服务商模型列表，不会生成{isImage ? "图片" : "视频"}，也不会消耗生成额度。</p> : null}
+          {isVideo ? <p className="credential-test-note">本地资产不能直接作为参考图提交；正式生成前需要增加临时公网素材上传。</p> : null}
           <dl>
-            <div><dt>服务商</dt><dd>{isImage ? "不鸣AI" : "OpenAI 兼容"}</dd></div>
+            <div><dt>服务商</dt><dd>{isImage ? "不鸣AI" : isVideo ? "睡哭了" : "OpenAI 兼容"}</dd></div>
             <div><dt>模型</dt><dd>{model || "尚未填写"}</dd></div>
             <div><dt>凭据状态</dt><dd>{settings?.hasCredential ? "已安全保存" : "尚未保存"}</dd></div>
             <div><dt>数据位置</dt><dd>仅限这台电脑</dd></div>

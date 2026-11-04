@@ -272,10 +272,17 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             assert request.headers["Authorization"] in {
                 "Bearer secret-not-for-sqlite",
                 "Bearer image-secret-not-for-sqlite",
+                "Bearer video-secret-not-for-sqlite",
             }
             return httpx.Response(
                 200,
-                json={"data": [{"id": "example-chat"}, {"id": "tt-image-2.5"}]},
+                json={
+                    "data": [
+                        {"id": "example-chat"},
+                        {"id": "tt-image-2.5"},
+                        {"id": "BD Seedance2.5"},
+                    ]
+                },
             )
         assert request.headers["Authorization"] == "Bearer secret-not-for-sqlite"
         assert request.url == "https://example.com/v1/chat/completions"
@@ -440,6 +447,36 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert image_connection.json()["connected"] is True
         assert image_connection.json()["model"] == "tt-image-2.5"
         assert "未生成图片" in image_connection.json()["message"]
+
+        empty_video_settings = client.get("/api/settings/video-model")
+        assert empty_video_settings.status_code == 200
+        assert empty_video_settings.json()["configured"] is False
+
+        configured_video = client.put(
+            "/api/settings/video-model",
+            json={
+                "baseUrl": "https://shuikule.top/v1/",
+                "model": "BD Seedance2.5",
+                "apiKey": "video-secret-not-for-sqlite",
+            },
+        )
+        assert configured_video.status_code == 200
+        assert configured_video.json() == {
+            "provider": "shuikule-openai-compatible",
+            "baseUrl": "https://shuikule.top/v1",
+            "model": "BD Seedance2.5",
+            "hasCredential": True,
+            "configured": True,
+            "updatedAt": configured_video.json()["updatedAt"],
+        }
+        assert "apiKey" not in configured_video.json()
+        assert credentials.values["video-model-api-key"] == "video-secret-not-for-sqlite"
+
+        video_connection = client.post("/api/settings/video-model/test")
+        assert video_connection.status_code == 200
+        assert video_connection.json()["connected"] is True
+        assert video_connection.json()["model"] == "BD Seedance2.5"
+        assert "未生成视频" in video_connection.json()["message"]
 
         created = client.post(
             "/api/projects",
@@ -900,6 +937,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
     database_bytes = (tmp_path / "mingyan.sqlite3").read_bytes()
     assert b"secret-not-for-sqlite" not in database_bytes
     assert b"image-secret-not-for-sqlite" not in database_bytes
+    assert b"video-secret-not-for-sqlite" not in database_bytes
 
     with TestClient(
         create_app(
@@ -959,6 +997,9 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         image_settings = client.get("/api/settings/image-model").json()
         assert image_settings["configured"] is True
         assert image_settings["model"] == "tt-image-2.5"
+        video_settings = client.get("/api/settings/video-model").json()
+        assert video_settings["configured"] is True
+        assert video_settings["model"] == "BD Seedance2.5"
 
 
 def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:

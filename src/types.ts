@@ -80,6 +80,15 @@ export interface ImageModelSettings {
   updatedAt: string | null;
 }
 
+export interface VideoModelSettings {
+  provider: "shuikule-openai-compatible";
+  baseUrl: string;
+  model: string;
+  hasCredential: boolean;
+  configured: boolean;
+  updatedAt: string | null;
+}
+
 export interface ScriptCharacter {
   name: string;
   identity: string;

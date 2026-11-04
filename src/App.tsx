@@ -11,8 +11,13 @@ import { TopBar } from "./components/TopBar";
 import { VideoWorkspace } from "./components/VideoWorkspace";
 import { Workspace } from "./components/Workspace";
 import { useProjects } from "./hooks/useProjects";
-import { getImageModelSettings, getTextModelSettings } from "./lib/api";
-import type { ImageModelSettings, PageId, TextModelSettings } from "./types";
+import { getImageModelSettings, getTextModelSettings, getVideoModelSettings } from "./lib/api";
+import type {
+  ImageModelSettings,
+  PageId,
+  TextModelSettings,
+  VideoModelSettings,
+} from "./types";
 
 const PAGE_TITLES: Record<Exclude<PageId, "workspace" | "source">, string> = {
   storyboard: "分镜工作台",
@@ -31,6 +36,7 @@ export default function App() {
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [textModelSettings, setTextModelSettings] = useState<TextModelSettings | null>(null);
   const [imageModelSettings, setImageModelSettings] = useState<ImageModelSettings | null>(null);
+  const [videoModelSettings, setVideoModelSettings] = useState<VideoModelSettings | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const {
     projects,
@@ -44,11 +50,12 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    Promise.all([getTextModelSettings(), getImageModelSettings()])
-      .then(([textSettings, imageSettings]) => {
+    Promise.all([getTextModelSettings(), getImageModelSettings(), getVideoModelSettings()])
+      .then(([textSettings, imageSettings, videoSettings]) => {
         if (!active) return;
         setTextModelSettings(textSettings);
         setImageModelSettings(imageSettings);
+        setVideoModelSettings(videoSettings);
       })
       .catch((settingsLoadError: unknown) => {
         if (!active) return;
@@ -80,6 +87,7 @@ export default function App() {
             onOpenTasks={() => setActivePage("tasks")}
             textModelConfigured={textModelSettings?.configured ?? false}
             imageModelConfigured={imageModelSettings?.configured ?? false}
+            videoModelConfigured={videoModelSettings?.configured ?? false}
           />
         ) : activePage === "source" ? (
           <SourceEditor
@@ -95,6 +103,7 @@ export default function App() {
           <ApiSettings
             textSettings={textModelSettings}
             imageSettings={imageModelSettings}
+            videoSettings={videoModelSettings}
             loadError={settingsError}
             onTextSettingsChange={(settings) => {
               setTextModelSettings(settings);
@@ -102,6 +111,10 @@ export default function App() {
             }}
             onImageSettingsChange={(settings) => {
               setImageModelSettings(settings);
+              setSettingsError(null);
+            }}
+            onVideoSettingsChange={(settings) => {
+              setVideoModelSettings(settings);
               setSettingsError(null);
             }}
           />
@@ -125,7 +138,9 @@ export default function App() {
             project={currentProject}
             onBack={() => setActivePage("workspace")}
             onOpenAssets={() => setActivePage("assets")}
+            onOpenApiSettings={() => setActivePage("api")}
             onPlanReady={() => updateStage("video")}
+            videoModelConfigured={videoModelSettings?.configured ?? false}
           />
         ) : activePage === "tasks" ? (
           <TaskCenter

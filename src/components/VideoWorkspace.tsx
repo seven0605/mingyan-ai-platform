@@ -18,7 +18,9 @@ interface VideoWorkspaceProps {
   project: Project | null;
   onBack: () => void;
   onOpenAssets: () => void;
+  onOpenApiSettings: () => void;
   onPlanReady: () => Promise<void>;
+  videoModelConfigured: boolean;
 }
 
 const KIND_LABEL = { character: "角色", scene: "场景", prop: "道具" } as const;
@@ -27,7 +29,9 @@ export function VideoWorkspace({
   project,
   onBack,
   onOpenAssets,
+  onOpenApiSettings,
   onPlanReady,
+  videoModelConfigured,
 }: VideoWorkspaceProps) {
   const [plan, setPlan] = useState<VideoProductionPlan | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -239,7 +243,13 @@ export function VideoWorkspace({
 
           <footer className="video-next-step">
             <Film size={21} />
-            <div><strong>下一步：接入视频模型</strong><p>生产清单确认后，再增加服务商配置、额度确认、顺序生成、失败恢复和视频预览。</p></div>
+            <div>
+              <strong>{videoModelConfigured ? "视频模型已配置" : "下一步：配置视频模型"}</strong>
+              <p>{videoModelConfigured ? "连接已保存；正式生成前仍需完成素材公网直链与额度确认。" : "先保存服务商、模型和密钥，并进行不会消耗额度的模型列表测试。"}</p>
+            </div>
+            <button className="button secondary compact" type="button" onClick={onOpenApiSettings}>
+              {videoModelConfigured ? "查看配置" : "配置视频模型"}
+            </button>
           </footer>
         </>
       )}

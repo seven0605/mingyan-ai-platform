@@ -145,6 +145,19 @@ class ImageModelSettingsOut(BaseModel):
     updatedAt: str | None
 
 
+class VideoModelSettingsUpdate(TextModelSettingsUpdate):
+    pass
+
+
+class VideoModelSettingsOut(BaseModel):
+    provider: Literal["shuikule-openai-compatible"]
+    baseUrl: str
+    model: str
+    hasCredential: bool
+    configured: bool
+    updatedAt: str | None
+
+
 class ScriptCharacter(BaseModel):
     name: str
     identity: str
@@ -1487,6 +1500,42 @@ def create_app(
             raise HTTPException(status_code=409, detail="系统凭据库中没有找到图像 API 密钥")
         return settings, api_key
 
+    def video_model_settings() -> VideoModelSettingsOut:
+        with connect(database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM model_settings WHERE kind = ?", ("video",)
+            ).fetchone()
+        try:
+            has_credential = bool(credentials.get("video-model-api-key"))
+        except KeyringError as error:
+            raise HTTPException(
+                status_code=503, detail="无法访问系统凭据库，请检查系统钥匙串服务"
+            ) from error
+        base_url = row["base_url"] if row else ""
+        model = row["model"] if row else ""
+        return VideoModelSettingsOut(
+            provider="shuikule-openai-compatible",
+            baseUrl=base_url,
+            model=model,
+            hasCredential=has_credential,
+            configured=bool(base_url and model and has_credential),
+            updatedAt=row["updated_at"] if row else None,
+        )
+
+    def video_model_credentials() -> tuple[VideoModelSettingsOut, str]:
+        settings = video_model_settings()
+        if not settings.configured:
+            raise HTTPException(status_code=409, detail="请先保存完整的视频模型配置")
+        try:
+            api_key = credentials.get("video-model-api-key")
+        except KeyringError as error:
+            raise HTTPException(
+                status_code=503, detail="无法访问系统凭据库，请检查系统钥匙串服务"
+            ) from error
+        if not api_key:
+            raise HTTPException(status_code=409, detail="系统凭据库中没有找到视频 API 密钥")
+        return settings, api_key
+
     def identity_reference_for_asset(
         project_id: str, asset: AssetItem
     ) -> tuple[str, str]:
@@ -1963,6 +2012,87 @@ def create_app(
             model=settings.model,
             latencyMs=latency_ms,
             message="鉴权成功，图像模型可用（未生成图片）",
+        )
+
+    @application.get("/api/settings/video-model", response_model=VideoModelSettingsOut)
+    def get_video_model_settings() -> VideoModelSettingsOut:
+        return video_model_settings()
+
+    @application.put("/api/settings/video-model", response_model=VideoModelSettingsOut)
+    def update_video_model_settings(
+        payload: VideoModelSettingsUpdate,
+    ) -> VideoModelSettingsOut:
+        if payload.apiKey:
+            try:
+                credentials.set("video-model-api-key", payload.apiKey)
+            except KeyringError as error:
+                raise HTTPException(
+                    status_code=503, detail="密钥无法写入系统凭据库，请检查系统钥匙串服务"
+                ) from error
+        now = utc_now()
+        with connect(database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO model_settings (kind, base_url, model, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(kind) DO UPDATE SET
+                    base_url = excluded.base_url,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                ("video", payload.baseUrl, payload.model, now),
+            )
+        return video_model_settings()
+
+    @application.post(
+        "/api/settings/video-model/test", response_model=TextModelConnectionOut
+    )
+    def test_video_model_connection() -> TextModelConnectionOut:
+        settings, api_key = video_model_credentials()
+        models_url = (
+            f"{settings.baseUrl}/models"
+            if settings.baseUrl.endswith("/v1")
+            else f"{settings.baseUrl}/v1/models"
+        )
+        started_at = time.perf_counter()
+        try:
+            with httpx.Client(
+                transport=model_transport, timeout=15, follow_redirects=True
+            ) as client:
+                response = client.get(
+                    models_url, headers={"Authorization": f"Bearer {api_key}"}
+                )
+        except httpx.RequestError as error:
+            raise HTTPException(
+                status_code=502, detail=f"无法连接视频模型服务：{type(error).__name__}"
+            ) from error
+
+        latency_ms = round((time.perf_counter() - started_at) * 1000)
+        if response.status_code in {401, 403}:
+            raise HTTPException(status_code=502, detail="视频模型服务拒绝鉴权，请检查 API 密钥")
+        if not response.is_success:
+            raise HTTPException(
+                status_code=502,
+                detail=f"视频模型服务返回 HTTP {response.status_code}，请检查接口地址",
+            )
+        try:
+            model_ids = {
+                item.get("id")
+                for item in response.json().get("data", [])
+                if isinstance(item, dict)
+            }
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=502, detail="视频模型服务返回了无法识别的数据") from error
+        if settings.model not in model_ids:
+            raise HTTPException(
+                status_code=502,
+                detail=f"鉴权成功，但模型列表中没有 {settings.model}",
+            )
+        return TextModelConnectionOut(
+            connected=True,
+            model=settings.model,
+            latencyMs=latency_ms,
+            message="鉴权成功，视频模型可用（未生成视频）",
         )
 
     @application.get("/api/projects", response_model=list[ProjectOut])

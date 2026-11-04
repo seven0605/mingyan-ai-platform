@@ -15,6 +15,7 @@ import type {
   StoryAnalysis,
   TextModelConnection,
   TextModelSettings,
+  VideoModelSettings,
   VideoProductionPlan,
 } from "../types";
 
@@ -117,6 +118,27 @@ export function saveImageModelSettings(input: {
 
 export function testImageModelConnection() {
   return request<TextModelConnection>("/api/settings/image-model/test", {
+    method: "POST",
+  });
+}
+
+export function getVideoModelSettings() {
+  return request<VideoModelSettings>("/api/settings/video-model");
+}
+
+export function saveVideoModelSettings(input: {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+}) {
+  return request<VideoModelSettings>("/api/settings/video-model", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function testVideoModelConnection() {
+  return request<TextModelConnection>("/api/settings/video-model/test", {
     method: "POST",
   });
 }
