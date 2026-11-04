@@ -2,6 +2,9 @@ import {
   ArrowLeft,
   Check,
   CircleAlert,
+  Cloud,
+  CloudOff,
+  ExternalLink,
   Film,
   Image as ImageIcon,
   ListVideo,
@@ -11,8 +14,19 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { confirmVideoProductionPlan, getVideoProductionPlan } from "../lib/api";
-import type { Project, VideoProductionPlan, VideoProductionPlanItem } from "../types";
+import {
+  confirmVideoProductionPlan,
+  getAssetTunnelStatus,
+  getVideoProductionPlan,
+  startAssetTunnel,
+  stopAssetTunnel,
+} from "../lib/api";
+import type {
+  AssetTunnelStatus,
+  Project,
+  VideoProductionPlan,
+  VideoProductionPlanItem,
+} from "../types";
 
 interface VideoWorkspaceProps {
   project: Project | null;
@@ -36,8 +50,10 @@ export function VideoWorkspace({
   const [plan, setPlan] = useState<VideoProductionPlan | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [tunnel, setTunnel] = useState<AssetTunnelStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [tunnelBusy, setTunnelBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const projectId = project?.id;
 
@@ -46,8 +62,12 @@ export function VideoWorkspace({
     setLoading(true);
     setError(null);
     try {
-      const result = await getVideoProductionPlan(projectId);
+      const [result, tunnelResult] = await Promise.all([
+        getVideoProductionPlan(projectId),
+        getAssetTunnelStatus(),
+      ]);
       setPlan(result);
+      setTunnel(tunnelResult);
       setSelectedIds(result.current ? result.selectedItemIds : []);
       setActiveId((current) => (
         current && result.items.some((item) => item.id === current)
@@ -95,6 +115,23 @@ export function VideoWorkspace({
       setError(saveError instanceof Error ? saveError.message : "视频生产清单保存失败");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const changeTunnel = async (start: boolean) => {
+    if (!project) return;
+    setTunnelBusy(true);
+    setError(null);
+    try {
+      setTunnel(
+        start
+          ? await startAssetTunnel(project.id)
+          : await stopAssetTunnel(project.id),
+      );
+    } catch (tunnelError) {
+      setError(tunnelError instanceof Error ? tunnelError.message : "临时素材通道操作失败");
+    } finally {
+      setTunnelBusy(false);
     }
   };
 
@@ -240,6 +277,45 @@ export function VideoWorkspace({
               ) : <div className="video-no-selection"><ListVideo size={26} />请选择一个镜头组查看生产资料</div>}
             </article>
           </div>
+
+          <section className={tunnel?.running ? "video-tunnel-card running" : "video-tunnel-card"}>
+            <div className="video-tunnel-icon">
+              {tunnel?.running ? <Cloud size={22} /> : <CloudOff size={22} />}
+            </div>
+            <div>
+              <strong>{tunnel?.running ? "临时素材通道运行中" : "临时素材公网通道"}</strong>
+              <p>
+                {tunnel?.running
+                  ? `仅开放本清单的 ${tunnel.exposedAssetCount} 项参考素材；视频任务结束后立即关闭。`
+                  : tunnel?.installed
+                    ? "已检测到 cloudflared；确认生产清单后可开启随机令牌保护的临时 HTTPS 通道。"
+                    : "尚未检测到 cloudflared。安装完成前不会开放任何本地素材。"}
+              </p>
+              {tunnel?.running && tunnel.publicUrl ? <small>{tunnel.publicUrl}</small> : null}
+              {tunnel?.running ? <small className="warning">{tunnel.warning}</small> : null}
+              {tunnel?.error ? <small className="error">{tunnel.error}</small> : null}
+            </div>
+            {!tunnel?.installed ? (
+              <a
+                className="button secondary compact"
+                href="https://developers.cloudflare.com/tunnel/downloads/"
+                target="_blank"
+                rel="noreferrer"
+              >
+                官方安装说明 <ExternalLink size={14} />
+              </a>
+            ) : (
+              <button
+                className={tunnel.running ? "button secondary compact" : "button primary compact"}
+                type="button"
+                disabled={tunnelBusy || (!tunnel.running && (!plan.current || !selectedIds.length))}
+                onClick={() => void changeTunnel(!tunnel.running)}
+              >
+                {tunnelBusy ? <LoaderCircle className="spinning" size={15} /> : tunnel.running ? <CloudOff size={15} /> : <Cloud size={15} />}
+                {tunnelBusy ? "正在处理…" : tunnel.running ? "立即关闭" : "开启临时通道"}
+              </button>
+            )}
+          </section>
 
           <footer className="video-next-step">
             <Film size={21} />

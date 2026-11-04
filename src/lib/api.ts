@@ -1,4 +1,5 @@
 import type {
+  AssetTunnelStatus,
   AssetBatchPlan,
   AssetLibrary,
   ImageModelSettings,
@@ -308,5 +309,21 @@ export function confirmVideoProductionPlan(projectId: string, itemIds: string[])
   return request<VideoProductionPlan>(`/api/projects/${projectId}/video-plan`, {
     method: "POST",
     body: JSON.stringify({ itemIds }),
+  });
+}
+
+export function getAssetTunnelStatus() {
+  return request<AssetTunnelStatus>("/api/settings/asset-tunnel");
+}
+
+export function startAssetTunnel(projectId: string) {
+  return request<AssetTunnelStatus>(`/api/projects/${projectId}/asset-tunnel`, {
+    method: "POST",
+  });
+}
+
+export function stopAssetTunnel(projectId: string) {
+  return request<AssetTunnelStatus>(`/api/projects/${projectId}/asset-tunnel`, {
+    method: "DELETE",
   });
 }

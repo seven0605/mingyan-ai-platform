@@ -27,6 +27,7 @@ from pydantic import (
     model_validator,
 )
 
+from server.asset_tunnel import TemporaryAssetTunnel
 from server.credential_store import CredentialStore, SystemCredentialStore
 from server.script_planning import build_script_messages, extract_json_object
 from server.screenplay_generation import (
@@ -530,6 +531,17 @@ class VideoProductionPlanOut(BaseModel):
     assetLibraryUpdatedAt: str
     current: bool
     confirmedAt: str | None = None
+
+
+class AssetTunnelStatusOut(BaseModel):
+    provider: Literal["cloudflare-quick-tunnel"]
+    installed: bool
+    running: bool
+    projectId: str | None
+    publicUrl: str | None
+    exposedAssetCount: int
+    error: str
+    warning: str
 
 
 class ProjectTaskOut(BaseModel):
@@ -1405,6 +1417,7 @@ def create_app(
     )
     database_path = resolved_data_dir / "mingyan.sqlite3"
     credentials = credential_store or SystemCredentialStore()
+    asset_tunnel = TemporaryAssetTunnel(resolved_data_dir)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -1420,7 +1433,10 @@ def create_app(
                 """,
                 (utc_now(),),
             )
-        yield
+        try:
+            yield
+        finally:
+            asset_tunnel.stop()
 
     application = FastAPI(title="明琰AI平台本地服务", version="0.1.0", lifespan=lifespan)
 
@@ -1535,6 +1551,35 @@ def create_app(
         if not api_key:
             raise HTTPException(status_code=409, detail="系统凭据库中没有找到视频 API 密钥")
         return settings, api_key
+
+    def asset_tunnel_status() -> AssetTunnelStatusOut:
+        status = asset_tunnel.status()
+        return AssetTunnelStatusOut(
+            provider="cloudflare-quick-tunnel",
+            installed=status.installed,
+            running=status.running,
+            projectId=status.project_id,
+            publicUrl=status.public_url,
+            exposedAssetCount=status.exposed_asset_count,
+            error=status.error,
+            warning=(
+                "临时地址只用于当前视频任务；任何持有完整随机链接的人都能读取已开放素材。"
+                "任务结束后请立即关闭通道。"
+            ),
+        )
+
+    def asset_reference_file_path(
+        project_id: str, asset_id: str, image_id: str
+    ) -> Path | None:
+        image_dir = resolved_data_dir / "generated" / project_id / asset_id
+        return next(
+            (
+                path
+                for suffix in (".png", ".jpg", ".jpeg", ".webp")
+                if (path := image_dir / f"{image_id}{suffix}").is_file()
+            ),
+            None,
+        )
 
     def identity_reference_for_asset(
         project_id: str, asset: AssetItem
@@ -2094,6 +2139,12 @@ def create_app(
             latencyMs=latency_ms,
             message="鉴权成功，视频模型可用（未生成视频）",
         )
+
+    @application.get(
+        "/api/settings/asset-tunnel", response_model=AssetTunnelStatusOut
+    )
+    def get_asset_tunnel_status() -> AssetTunnelStatusOut:
+        return asset_tunnel_status()
 
     @application.get("/api/projects", response_model=list[ProjectOut])
     def list_projects() -> list[ProjectOut]:
@@ -3219,6 +3270,72 @@ def create_app(
             current=True,
             confirmedAt=now,
         )
+
+    @application.post(
+        "/api/projects/{project_id}/asset-tunnel",
+        response_model=AssetTunnelStatusOut,
+    )
+    def start_asset_tunnel(project_id: str) -> AssetTunnelStatusOut:
+        storyboard_rows, asset_row, saved_plan = video_plan_inputs(project_id)
+        items, storyboard_updated_at, asset_library_updated_at = (
+            build_video_plan_items(storyboard_rows, asset_row)
+        )
+        if (
+            saved_plan is None
+            or saved_plan["storyboard_updated_at"] != storyboard_updated_at
+            or saved_plan["asset_library_updated_at"] != asset_library_updated_at
+        ):
+            raise HTTPException(status_code=409, detail="请先保存当前版本的视频生产清单")
+        selection = VideoPlanSelectionPayload.model_validate(
+            json.loads(saved_plan["payload"])
+        )
+        items_by_id = {item.id: item for item in items}
+        selected_items = [
+            items_by_id[item_id]
+            for item_id in selection.selectedItemIds
+            if item_id in items_by_id
+        ]
+        if not selected_items or len(selected_items) != len(selection.selectedItemIds):
+            raise HTTPException(status_code=409, detail="视频生产清单为空或包含过期镜头组")
+        if any(not item.ready for item in selected_items):
+            raise HTTPException(status_code=409, detail="视频生产清单中仍有未就绪镜头组")
+
+        files: dict[str, Path] = {}
+        for item in selected_items:
+            for reference in item.assetReferences:
+                logical_id = f"{reference.assetId}:{reference.imageId}"
+                if logical_id in files:
+                    continue
+                image_path = asset_reference_file_path(
+                    project_id, reference.assetId, reference.imageId
+                )
+                if image_path is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{reference.name} 的主参考图文件不存在",
+                    )
+                files[logical_id] = image_path
+        try:
+            asset_tunnel.start(project_id, files)
+        except FileNotFoundError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="尚未安装 cloudflared，无法开启临时公网通道",
+            ) from error
+        except (OSError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        return asset_tunnel_status()
+
+    @application.delete(
+        "/api/projects/{project_id}/asset-tunnel",
+        response_model=AssetTunnelStatusOut,
+    )
+    def stop_asset_tunnel(project_id: str) -> AssetTunnelStatusOut:
+        status = asset_tunnel.status()
+        if status.running and status.project_id != project_id:
+            raise HTTPException(status_code=409, detail="临时通道正在被其他项目使用")
+        asset_tunnel.stop()
+        return asset_tunnel_status()
 
     @application.get(
         "/api/projects/{project_id}/assets", response_model=AssetLibraryOut | None

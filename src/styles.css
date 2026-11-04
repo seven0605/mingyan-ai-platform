@@ -5281,6 +5281,72 @@ textarea:focus-visible {
   font-size: 12px;
 }
 
+.video-tunnel-card {
+  margin-top: 14px;
+  padding: 15px 16px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 13px;
+  border: 1px solid rgba(213, 185, 131, 0.2);
+  border-radius: 10px;
+  background: rgba(145, 106, 48, 0.06);
+}
+
+.video-tunnel-card.running {
+  border-color: rgba(126, 236, 182, 0.22);
+  background: rgba(126, 236, 182, 0.05);
+}
+
+.video-tunnel-icon {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(213, 185, 131, 0.2);
+  border-radius: 9px;
+  color: #d5b983;
+  background: rgba(145, 106, 48, 0.08);
+}
+
+.video-tunnel-card.running .video-tunnel-icon {
+  color: var(--success);
+  border-color: rgba(126, 236, 182, 0.2);
+  background: rgba(126, 236, 182, 0.07);
+}
+
+.video-tunnel-card strong {
+  font-size: 12px;
+}
+
+.video-tunnel-card p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.video-tunnel-card small {
+  margin-top: 5px;
+  display: block;
+  color: #a9d9c1;
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}
+
+.video-tunnel-card small.warning {
+  color: #d5b983;
+}
+
+.video-tunnel-card small.error {
+  color: var(--danger);
+}
+
+.video-tunnel-card > .button {
+  text-decoration: none;
+  white-space: nowrap;
+}
+
 .video-next-step {
   margin-top: 14px;
   padding: 14px 16px;

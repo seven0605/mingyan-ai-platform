@@ -372,6 +372,17 @@ export interface VideoProductionPlan {
   confirmedAt: string | null;
 }
 
+export interface AssetTunnelStatus {
+  provider: "cloudflare-quick-tunnel";
+  installed: boolean;
+  running: boolean;
+  projectId: string | null;
+  publicUrl: string | null;
+  exposedAssetCount: number;
+  error: string;
+  warning: string;
+}
+
 export type ProjectTaskStatus = "queued" | "running" | "completed" | "failed" | "interrupted";
 
 export interface ProjectTask {

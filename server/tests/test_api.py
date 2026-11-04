@@ -6,6 +6,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from server.app import asset_aspect_ratio, create_app, is_collective_character
+from server.asset_tunnel import TemporaryAssetTunnel
 
 
 class MemoryCredentialStore:
@@ -25,6 +26,27 @@ def test_collective_characters_use_widescreen() -> None:
     assert is_collective_character("character", "云子姝") is False
     assert asset_aspect_ratio("live-action", "character", "萧府护卫们") == "16:9"
     assert asset_aspect_ratio("live-action", "character", "云子姝") == "9:16"
+
+
+def test_temporary_asset_gateway_only_serves_whitelisted_files(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed.png"
+    allowed.write_bytes(b"\x89PNG\r\n\x1a\npublic-test")
+    hidden = tmp_path / "hidden.png"
+    hidden.write_bytes(b"\x89PNG\r\n\x1a\nhidden-test")
+    tunnel = TemporaryAssetTunnel(tmp_path)
+    urls = tunnel.start_local("project-1", {"allowed": allowed})
+    try:
+        response = httpx.get(urls["allowed"])
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.content.endswith(b"public-test")
+        assert httpx.head(urls["allowed"]).status_code == 200
+        local_root = urls["allowed"].split("/media/", 1)[0]
+        assert httpx.get(f"{local_root}/api/projects").status_code == 404
+        assert httpx.get(f"{local_root}/media/wrong-token/hidden.png").status_code == 404
+    finally:
+        tunnel.stop()
 
 
 def test_project_lifecycle_persists(tmp_path: Path) -> None:
@@ -478,6 +500,13 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert video_connection.json()["model"] == "BD Seedance2.5"
         assert "未生成视频" in video_connection.json()["message"]
 
+        tunnel_status = client.get("/api/settings/asset-tunnel")
+        assert tunnel_status.status_code == 200
+        assert tunnel_status.json()["provider"] == "cloudflare-quick-tunnel"
+        assert tunnel_status.json()["running"] is False
+        assert tunnel_status.json()["publicUrl"] is None
+        assert tunnel_status.json()["exposedAssetCount"] == 0
+
         created = client.post(
             "/api/projects",
             json={"name": "跨平台测试", "description": "Mac 与 Windows 共用数据结构"},
@@ -926,6 +955,11 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert confirmed_video_plan.json()["current"] is True
         assert confirmed_video_plan.json()["selectedItemIds"] == selected_video_ids
         assert client.get("/api/projects").json()[0]["stage"] == "video"
+        missing_cloudflared = client.post(
+            f"/api/projects/{project['id']}/asset-tunnel"
+        )
+        assert missing_cloudflared.status_code == 409
+        assert "cloudflared" in missing_cloudflared.json()["detail"]
 
         assert client.put(
             f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images/{generated_image['id']}/primary"
