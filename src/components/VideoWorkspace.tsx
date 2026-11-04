@@ -79,12 +79,14 @@ export function VideoWorkspace({
 }: VideoWorkspaceProps) {
   const [plan, setPlan] = useState<VideoProductionPlan | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [referenceImageIds, setReferenceImageIds] = useState<Record<string, Record<string, string>>>({});
   const [activeId, setActiveId] = useState<string | null>(null);
   const [tunnel, setTunnel] = useState<AssetTunnelStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [tunnelBusy, setTunnelBusy] = useState(false);
   const [queueing, setQueueing] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const projectId = project?.id;
 
@@ -100,6 +102,8 @@ export function VideoWorkspace({
       setPlan(result);
       setTunnel(tunnelResult);
       setSelectedIds(result.current ? result.selectedItemIds : []);
+      setReferenceImageIds(result.referenceImageIds);
+      setDirty(false);
       setActiveId((current) => (
         current && result.items.some((item) => item.id === current)
           ? current
@@ -124,9 +128,11 @@ export function VideoWorkspace({
   const readyItems = plan?.items.filter((item) => item.ready) ?? [];
   const blockedCount = (plan?.items.length ?? 0) - readyItems.length;
   const requestCount = countVideoRequests(plan?.items ?? [], selectedIds);
+  const planReady = Boolean(plan?.current && !dirty && selectedIds.length);
 
   const toggleItem = (item: VideoProductionPlanItem) => {
     if (!item.ready) return;
+    setDirty(true);
     setSelectedIds((current) => (
       current.includes(item.id)
         ? current.filter((id) => id !== item.id)
@@ -135,19 +141,47 @@ export function VideoWorkspace({
   };
 
   const savePlan = async () => {
-    if (!project || !selectedIds.length) return;
+    if (!project || !plan || !selectedIds.length) return;
     setSaving(true);
     setError(null);
     try {
-      const saved = await confirmVideoProductionPlan(project.id, selectedIds);
+      const selectedReferenceImageIds = Object.fromEntries(
+        plan.items
+          .filter((item) => selectedIds.includes(item.id))
+          .map((item) => [
+            item.id,
+            Object.fromEntries(item.assetReferences.map((reference) => [
+              reference.assetId,
+              referenceImageIds[item.id]?.[reference.assetId] ?? reference.imageId,
+            ])),
+          ]),
+      );
+      const saved = await confirmVideoProductionPlan(
+        project.id,
+        selectedIds,
+        selectedReferenceImageIds,
+      );
       setPlan(saved);
       setSelectedIds(saved.selectedItemIds);
+      setReferenceImageIds(saved.referenceImageIds);
+      setDirty(false);
       await onPlanReady();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "视频生产清单保存失败");
     } finally {
       setSaving(false);
     }
+  };
+
+  const selectReferenceImage = (itemId: string, assetId: string, imageId: string) => {
+    setReferenceImageIds((current) => ({
+      ...current,
+      [itemId]: {
+        ...current[itemId],
+        [assetId]: imageId,
+      },
+    }));
+    setDirty(true);
   };
 
   const changeTunnel = async (start: boolean) => {
@@ -202,9 +236,13 @@ export function VideoWorkspace({
           <h1>视频生产工作台</h1>
           <p>{project.name} · 分镜组、资产参考与视频提示词生产预检</p>
         </div>
-        <div className={plan?.current ? "video-plan-status current" : "video-plan-status"}>
+        <div className={plan?.current && !dirty ? "video-plan-status current" : "video-plan-status"}>
           <ShieldCheck size={17} />
-          {plan?.current ? `生产清单已确认 ${plan.selectedItemIds.length} 组` : "尚未确认生产清单"}
+          {dirty
+            ? "镜头或状态图有未保存修改"
+            : plan?.current
+              ? `生产清单已确认 ${plan.selectedItemIds.length} 组`
+              : "尚未确认生产清单"}
         </div>
       </header>
 
@@ -245,7 +283,10 @@ export function VideoWorkspace({
               className="button secondary compact"
               type="button"
               disabled={!readyItems.length}
-              onClick={() => setSelectedIds(readyItems.map((item) => item.id))}
+              onClick={() => {
+                setSelectedIds(readyItems.map((item) => item.id));
+                setDirty(true);
+              }}
             >
               <Check size={15} /> 选择全部可用项
             </button>
@@ -302,15 +343,47 @@ export function VideoWorkspace({
                   ) : null}
 
                   <section className="video-reference-section">
-                    <h3><ImageIcon size={16} /> 自动关联的主参考图</h3>
+                    <h3><ImageIcon size={16} /> 镜头级状态参考图</h3>
                     {activeItem.assetReferences.length ? (
                       <div className="video-reference-grid">
-                        {activeItem.assetReferences.map((reference) => (
-                          <div key={reference.assetId}>
-                            <img src={reference.imageUrl} alt={`${reference.name}主参考图`} loading="lazy" />
-                            <span><b>{reference.name}</b><small>{KIND_LABEL[reference.kind]} · {reference.direct ? "直接命中" : "场次关联"}</small></span>
-                          </div>
-                        ))}
+                        {activeItem.assetReferences.map((reference) => {
+                          const selectedImageId = referenceImageIds[activeItem.id]?.[reference.assetId]
+                            ?? reference.imageId;
+                          const selectedImage = reference.availableImages.find(
+                            (image) => image.id === selectedImageId,
+                          ) ?? reference.availableImages[0] ?? {
+                            id: reference.imageId,
+                            url: reference.imageUrl,
+                            label: "当前主图",
+                            identityReferenceImageId: "",
+                          };
+                          return (
+                            <div key={reference.assetId}>
+                              <img src={selectedImage.url} alt={`${reference.name}镜头状态参考图`} loading="lazy" />
+                              <span><b>{reference.name}</b><small>{KIND_LABEL[reference.kind]} · {reference.direct ? "直接命中" : "场次关联"}</small></span>
+                              {reference.availableImages.length > 1 ? (
+                                <label className="video-reference-picker">
+                                  <span>本镜头使用</span>
+                                  <select
+                                    aria-label={`${reference.name}镜头组${activeItem.groupIndex}状态参考图`}
+                                    value={selectedImage.id}
+                                    onChange={(event) => selectReferenceImage(
+                                      activeItem.id,
+                                      reference.assetId,
+                                      event.target.value,
+                                    )}
+                                  >
+                                    {reference.availableImages.map((image) => (
+                                      <option value={image.id} key={image.id}>
+                                        {image.label}{image.id === reference.imageId ? " · 当前已保存" : ""}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                              ) : null}
+                            </div>
+                          );
+                        })}
                       </div>
                     ) : <p className="video-empty-reference">当前镜头没有可用的资产主参考图。</p>}
                   </section>
@@ -354,7 +427,7 @@ export function VideoWorkspace({
               <button
                 className={tunnel.running ? "button secondary compact" : "button primary compact"}
                 type="button"
-                disabled={tunnelBusy || (!tunnel.running && (!plan.current || !selectedIds.length))}
+                disabled={tunnelBusy || (!tunnel.running && !planReady)}
                 onClick={() => void changeTunnel(!tunnel.running)}
               >
                 {tunnelBusy ? <LoaderCircle className="spinning" size={15} /> : tunnel.running ? <CloudOff size={15} /> : <Cloud size={15} />}
@@ -377,7 +450,7 @@ export function VideoWorkspace({
                 <button
                   className="button primary compact"
                   type="button"
-                  disabled={queueing || !plan.current || !selectedIds.length || !tunnel?.installed}
+                  disabled={queueing || !planReady || !tunnel?.installed}
                   onClick={() => void queueVideos()}
                 >
                   {queueing ? <LoaderCircle className="spinning" size={15} /> : <Play size={15} />}

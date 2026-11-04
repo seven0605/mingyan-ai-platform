@@ -5231,7 +5231,7 @@ textarea:focus-visible {
   background: #08090e;
 }
 
-.video-reference-grid span {
+.video-reference-grid > div > span {
   padding: 8px 9px;
   display: grid;
   gap: 3px;
@@ -5252,6 +5252,29 @@ textarea:focus-visible {
 
 .video-empty-reference {
   margin: 12px 0 0;
+}
+
+.video-reference-picker {
+  padding: 0 9px 9px;
+  display: grid;
+  gap: 5px;
+}
+
+.video-reference-picker span {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.video-reference-picker select {
+  min-width: 0;
+  width: 100%;
+  padding: 6px 7px;
+  border: 1px solid rgba(139, 124, 246, 0.3);
+  border-radius: 6px;
+  color: var(--text);
+  background: #11131b;
+  font: inherit;
+  font-size: 9px;
 }
 
 .video-prompt-section {

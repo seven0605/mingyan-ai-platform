@@ -305,10 +305,14 @@ export function getVideoProductionPlan(projectId: string) {
   return request<VideoProductionPlan>(`/api/projects/${projectId}/video-plan`);
 }
 
-export function confirmVideoProductionPlan(projectId: string, itemIds: string[]) {
+export function confirmVideoProductionPlan(
+  projectId: string,
+  itemIds: string[],
+  referenceImageIds: Record<string, Record<string, string>>,
+) {
   return request<VideoProductionPlan>(`/api/projects/${projectId}/video-plan`, {
     method: "POST",
-    body: JSON.stringify({ itemIds }),
+    body: JSON.stringify({ itemIds, referenceImageIds }),
   });
 }
 

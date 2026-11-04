@@ -378,6 +378,9 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             assert "【全局连续性硬锁】" in request_payload["prompt"]
             assert "【首帧锁定】" in request_payload["prompt"]
             assert "镜头节拍 1" in request_payload["prompt"]
+            assert "用于e1-g1" in request_payload["prompt"]
+            assert "用于e1-g2" in request_payload["prompt"]
+            assert "同名人物跨镜头组必须保持同一身份" in request_payload["prompt"]
             assert request_payload["size"] == "1280x720"
             reference_urls = request_payload["metadata"]["__workbench_refs"][
                 "reference_image_urls"
@@ -387,6 +390,8 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
                 url.startswith("https://assets.example.com/")
                 for url in reference_urls
             )
+            assert any(generated_image["id"] in url for url in reference_urls)
+            assert any(second_image["id"] in url for url in reference_urls)
             return httpx.Response(
                 200, json={"id": f"video-task-{len(video_requests)}"}
             )
@@ -1067,13 +1072,38 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             for item in video_plan.json()["items"]
         )
         selected_video_ids = [item["id"] for item in video_plan.json()["items"][:2]]
+        first_yun_reference = next(
+            reference
+            for reference in video_plan.json()["items"][0]["assetReferences"]
+            if reference["assetId"] == yun_zishu_id
+        )
+        assert len(first_yun_reference["availableImages"]) == 2
+        reference_image_ids = {
+            selected_video_ids[0]: {yun_zishu_id: generated_image["id"]},
+            selected_video_ids[1]: {yun_zishu_id: second_image["id"]},
+        }
         confirmed_video_plan = client.post(
             f"/api/projects/{project['id']}/video-plan",
-            json={"itemIds": selected_video_ids},
+            json={
+                "itemIds": selected_video_ids,
+                "referenceImageIds": reference_image_ids,
+            },
         )
         assert confirmed_video_plan.status_code == 200
         assert confirmed_video_plan.json()["current"] is True
         assert confirmed_video_plan.json()["selectedItemIds"] == selected_video_ids
+        assert confirmed_video_plan.json()["referenceImageIds"] == reference_image_ids
+        confirmed_items = confirmed_video_plan.json()["items"]
+        assert next(
+            reference
+            for reference in confirmed_items[0]["assetReferences"]
+            if reference["assetId"] == yun_zishu_id
+        )["imageId"] == generated_image["id"]
+        assert next(
+            reference
+            for reference in confirmed_items[1]["assetReferences"]
+            if reference["assetId"] == yun_zishu_id
+        )["imageId"] == second_image["id"]
         assert client.get("/api/projects").json()[0]["stage"] == "video"
         queued_videos = client.post(
             f"/api/projects/{project['id']}/video-plan/queue"
@@ -1161,6 +1191,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             f"/api/projects/{projects[0]['id']}/video-plan"
         ).json()
         assert restored_video_plan["selectedItemIds"] == selected_video_ids
+        assert restored_video_plan["referenceImageIds"] == reference_image_ids
         assert restored_video_plan["current"] is False
         settings = client.get("/api/settings/text-model").json()
         assert settings["configured"] is True

@@ -484,6 +484,13 @@ class AssetBatchPlanOut(AssetBatchPlanPayload):
     updatedAt: str
 
 
+class VideoPlanAssetImageOption(BaseModel):
+    id: str
+    url: str
+    label: str
+    identityReferenceImageId: str = ""
+
+
 class VideoPlanAssetReference(BaseModel):
     assetId: str
     kind: Literal["character", "scene", "prop"]
@@ -491,6 +498,7 @@ class VideoPlanAssetReference(BaseModel):
     imageId: str
     imageUrl: str
     direct: bool
+    availableImages: list[VideoPlanAssetImageOption]
 
 
 class VideoProductionPlanItem(BaseModel):
@@ -511,6 +519,7 @@ class VideoProductionPlanItem(BaseModel):
 
 class VideoPlanConfirm(BaseModel):
     itemIds: list[str] = Field(min_length=1, max_length=100)
+    referenceImageIds: dict[str, dict[str, str]] = Field(default_factory=dict)
 
     @field_validator("itemIds")
     @classmethod
@@ -522,12 +531,14 @@ class VideoPlanConfirm(BaseModel):
 
 class VideoPlanSelectionPayload(BaseModel):
     selectedItemIds: list[str]
+    referenceImageIds: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
 class VideoProductionPlanOut(BaseModel):
     projectId: str
     items: list[VideoProductionPlanItem]
     selectedItemIds: list[str]
+    referenceImageIds: dict[str, dict[str, str]]
     storyboardUpdatedAt: str
     assetLibraryUpdatedAt: str
     current: bool
@@ -911,6 +922,15 @@ def build_video_plan_items(
                 elif direct and requires_reference and primary is None:
                     blocking_reasons.append(f"{asset.name} 缺少主参考图")
                 if primary is not None and asset.status == "confirmed":
+                    available_images = [
+                        VideoPlanAssetImageOption(
+                            id=image.id,
+                            url=image.url,
+                            label=f"V{index + 1}",
+                            identityReferenceImageId=image.identityReferenceImageId,
+                        )
+                        for index, image in enumerate(asset.referenceImages)
+                    ]
                     references.append(
                         VideoPlanAssetReference(
                             assetId=asset.id,
@@ -919,6 +939,7 @@ def build_video_plan_items(
                             imageId=primary.id,
                             imageUrl=primary.url,
                             direct=direct,
+                            availableImages=available_images,
                         )
                     )
             if not group.videoPrompt.strip():
@@ -946,6 +967,25 @@ def build_video_plan_items(
                 )
             )
     return items, storyboard_updated_at, asset_library_updated_at
+
+
+def apply_video_reference_image_ids(
+    items: list[VideoProductionPlanItem],
+    reference_image_ids: dict[str, dict[str, str]],
+) -> None:
+    for item in items:
+        item_selections = reference_image_ids.get(item.id, {})
+        for reference in item.assetReferences:
+            image_id = item_selections.get(reference.assetId)
+            if not image_id:
+                continue
+            option = next(
+                (image for image in reference.availableImages if image.id == image_id),
+                None,
+            )
+            if option is not None:
+                reference.imageId = option.id
+                reference.imageUrl = option.url
 
 
 def asset_library_tasks(row: sqlite3.Row) -> list[ProjectTaskOut]:
@@ -2100,10 +2140,14 @@ def create_app(
                         reference_urls[str(reference["logicalId"])]
                         for reference in references
                     ]
-                    reference_guide = "；".join(
-                        f"图{index}={reference['name']}"
-                        for index, reference in enumerate(references, start=1)
-                    )
+                    reference_guide_parts: list[str] = []
+                    for index, reference in enumerate(references, start=1):
+                        item_ids = reference.get("itemIds", [])
+                        scope = f"（用于{'、'.join(item_ids)}）" if item_ids else ""
+                        reference_guide_parts.append(
+                            f"图{index}={reference['name']}{scope}"
+                        )
+                    reference_guide = "；".join(reference_guide_parts)
                     created = client.post(
                         f"{api_root}/videos",
                         headers={**headers, "Content-Type": "application/json"},
@@ -2111,7 +2155,9 @@ def create_app(
                             "model": job["model"],
                             "prompt": (
                                 f"【参考图顺序锁定】{reference_guide}。"
-                                "人物身份、服装和场景分别以对应参考图为准。\n\n"
+                                "人物身份、服装和场景分别以对应参考图为准；"
+                                "同名人物跨镜头组必须保持同一身份，仅允许服装、发型、"
+                                "伤势和情绪状态变化。\n\n"
                                 f"{job['prompt']}"
                             ),
                             "seconds": str(job["seconds"]),
@@ -3631,6 +3677,7 @@ def create_app(
         selection = VideoPlanSelectionPayload.model_validate(
             json.loads(saved_plan["payload"])
         )
+        apply_video_reference_image_ids(items, selection.referenceImageIds)
         items_by_id = {item.id: item for item in items}
         selected_items = [
             items_by_id[item_id]
@@ -3682,6 +3729,7 @@ def create_app(
             if saved_plan
             else VideoPlanSelectionPayload(selectedItemIds=[])
         )
+        apply_video_reference_image_ids(items, selection.referenceImageIds)
         item_ids = {item.id for item in items}
         return VideoProductionPlanOut(
             projectId=project_id,
@@ -3689,6 +3737,7 @@ def create_app(
             selectedItemIds=[
                 item_id for item_id in selection.selectedItemIds if item_id in item_ids
             ],
+            referenceImageIds=selection.referenceImageIds,
             storyboardUpdatedAt=storyboard_updated_at,
             assetLibraryUpdatedAt=asset_library_updated_at,
             current=current,
@@ -3707,6 +3756,10 @@ def create_app(
             build_video_plan_items(storyboard_rows, asset_row)
         )
         items_by_id = {item.id: item for item in items}
+        if any(item_id not in payload.itemIds for item_id in payload.referenceImageIds):
+            raise HTTPException(
+                status_code=422, detail="状态参考图只能为本次选中的镜头组设置"
+            )
         for item_id in payload.itemIds:
             item = items_by_id.get(item_id)
             if item is None:
@@ -3716,8 +3769,31 @@ def create_app(
                     status_code=409,
                     detail=f"第 {item.episodeNumber} 集镜头组 {item.groupIndex} 尚未就绪",
                 )
+            references_by_asset = {
+                reference.assetId: reference for reference in item.assetReferences
+            }
+            for asset_id, image_id in payload.referenceImageIds.get(
+                item_id, {}
+            ).items():
+                reference = references_by_asset.get(asset_id)
+                if reference is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"镜头组 {item.groupIndex} 不包含所选资产",
+                    )
+                if image_id not in {
+                    image.id for image in reference.availableImages
+                }:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"{reference.name} 的状态参考图无效",
+                    )
         now = utc_now()
-        selection = VideoPlanSelectionPayload(selectedItemIds=payload.itemIds)
+        selection = VideoPlanSelectionPayload(
+            selectedItemIds=payload.itemIds,
+            referenceImageIds=payload.referenceImageIds,
+        )
+        apply_video_reference_image_ids(items, selection.referenceImageIds)
         with connect(database_path) as connection:
             connection.execute(
                 """
@@ -3747,6 +3823,7 @@ def create_app(
             projectId=project_id,
             items=items,
             selectedItemIds=payload.itemIds,
+            referenceImageIds=payload.referenceImageIds,
             storyboardUpdatedAt=storyboard_updated_at,
             assetLibraryUpdatedAt=asset_library_updated_at,
             current=True,
@@ -3788,19 +3865,23 @@ def create_app(
         with connect(database_path) as connection:
             for items in video_batches:
                 now = utc_now()
-                references_by_id: dict[str, dict[str, str]] = {}
+                references_by_id: dict[str, dict[str, object]] = {}
                 for item in items:
                     for reference in item.assetReferences:
                         logical_id = f"{reference.assetId}:{reference.imageId}"
-                        references_by_id.setdefault(
+                        saved_reference = references_by_id.setdefault(
                             logical_id,
                             {
                                 "logicalId": logical_id,
                                 "assetId": reference.assetId,
                                 "imageId": reference.imageId,
                                 "name": reference.name,
+                                "itemIds": [],
                             },
                         )
+                        item_ids = saved_reference["itemIds"]
+                        if isinstance(item_ids, list) and item.id not in item_ids:
+                            item_ids.append(item.id)
                 references = list(references_by_id.values())
                 first_item = items[0]
                 last_item = items[-1]

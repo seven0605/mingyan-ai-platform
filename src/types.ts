@@ -344,6 +344,12 @@ export interface VideoPlanAssetReference {
   imageId: string;
   imageUrl: string;
   direct: boolean;
+  availableImages: Array<{
+    id: string;
+    url: string;
+    label: string;
+    identityReferenceImageId: string;
+  }>;
 }
 
 export interface VideoProductionPlanItem {
@@ -366,6 +372,7 @@ export interface VideoProductionPlan {
   projectId: string;
   items: VideoProductionPlanItem[];
   selectedItemIds: string[];
+  referenceImageIds: Record<string, Record<string, string>>;
   storyboardUpdatedAt: string;
   assetLibraryUpdatedAt: string;
   current: boolean;
