@@ -350,6 +350,7 @@ class AssetItem(BaseModel):
     visualAnchor: str = ""
     continuityNotes: str = ""
     referencePrompt: str = ""
+    promptStandardSignature: str = ""
     referenceImages: list[AssetImageVersion] = Field(default_factory=list)
     primaryReferenceImageId: str | None = None
 
@@ -389,6 +390,26 @@ class AssetStandardSettings(BaseModel):
         "ming",
         "qing",
     ] = "auto"
+
+
+ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.1"
+
+
+def asset_standard_signature(settings: AssetStandardSettings) -> str:
+    return (
+        f"{settings.visualStandard}|{settings.costumeEra}|"
+        f"{ASSET_PROMPT_TEMPLATE_VERSION}"
+    )
+
+
+def asset_aspect_ratio(
+    standard: str, kind: Literal["character", "scene", "prop"]
+) -> str:
+    if standard == "western-dark-medieval":
+        return "16:9"
+    if standard in {"victorian-gothic", "guofeng-3d"}:
+        return "9:16" if kind == "character" else "16:9"
+    return "16:9" if kind == "scene" else "9:16"
 
 
 class AssetLibraryPayload(BaseModel):
@@ -2764,6 +2785,7 @@ def create_app(
             raise HTTPException(status_code=409, detail="剧本已更新，请重新整理资产")
 
         library = AssetLibraryPayload.model_validate(json.loads(asset_row["payload"]))
+        expected_signature = asset_standard_signature(library.standard)
         assets_by_id = {item.id: item for item in library.items}
         selected: list[AssetItem] = []
         for asset_id in request.assetIds:
@@ -2778,6 +2800,11 @@ def create_app(
                 raise HTTPException(status_code=409, detail=f"{asset.name} 尚未确认，不能加入生产清单")
             if not asset.referencePrompt.strip():
                 raise HTTPException(status_code=422, detail=f"{asset.name} 的生图提示词为空")
+            if asset.promptStandardSignature != expected_signature:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{asset.name} 尚未按当前资产标准重编提示词",
+                )
             selected.append(asset)
 
         cost_samples = [
@@ -2794,7 +2821,6 @@ def create_app(
             if estimated_unit_cost is not None
             else None
         )
-        aspect_ratios = {"character": "3:4", "scene": "16:9", "prop": "1:1"}
         now = utc_now()
         payload = AssetBatchPlanPayload(
             items=[
@@ -2803,7 +2829,9 @@ def create_app(
                     assetKind=item.kind,
                     name=item.name,
                     prompt=item.referencePrompt,
-                    aspectRatio=aspect_ratios[item.kind],
+                    aspectRatio=asset_aspect_ratio(
+                        library.standard.visualStandard, item.kind
+                    ),
                     existingVersionCount=len(item.referenceImages),
                 )
                 for item in selected
@@ -2865,6 +2893,7 @@ def create_app(
             raise HTTPException(status_code=409, detail="已有未完成的生成队列，请先处理任务中心中的任务")
 
         library = AssetLibraryPayload.model_validate(json.loads(asset_row["payload"]))
+        expected_signature = asset_standard_signature(library.standard)
         assets_by_id = {item.id: item for item in library.items}
         for plan_item in plan.items:
             asset = assets_by_id.get(plan_item.assetId)
@@ -2872,6 +2901,7 @@ def create_app(
                 asset is None
                 or asset.status != "confirmed"
                 or asset.referencePrompt != plan_item.prompt
+                or asset.promptStandardSignature != expected_signature
             ):
                 raise HTTPException(
                     status_code=409,
@@ -3200,13 +3230,14 @@ def create_app(
             raise HTTPException(status_code=409, detail="请先确认资产文字规范再生成参考图")
         if not asset.referencePrompt.strip():
             raise HTTPException(status_code=422, detail="资产生图提示词不能为空")
+        if asset.promptStandardSignature != asset_standard_signature(library.standard):
+            raise HTTPException(
+                status_code=409,
+                detail="该资产尚未按当前资产标准重编提示词",
+            )
 
         settings, api_key = image_model_credentials()
-        aspect_ratio = {
-            "character": "3:4",
-            "scene": "16:9",
-            "prop": "1:1",
-        }[asset.kind]
+        aspect_ratio = asset_aspect_ratio(library.standard.visualStandard, asset.kind)
         api_root = settings.baseUrl if settings.baseUrl.endswith("/v1") else f"{settings.baseUrl}/v1"
         headers = {"Authorization": f"Bearer {api_key}"}
         task_id = ""

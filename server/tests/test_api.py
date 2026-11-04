@@ -216,7 +216,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             request_payload = json.loads(request.content)
             assert request_payload["model"] == "tt-image-2.5"
             assert "云子姝" in request_payload["prompt"]
-            assert request_payload["params"]["aspect_ratio"] == "3:4"
+            assert request_payload["params"]["aspect_ratio"] == "9:16"
             assert request_payload["params"]["resolution"] == "1K"
             return httpx.Response(
                 200,
@@ -657,6 +657,10 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         yun_zishu = next(
             item for item in editable_assets["items"] if item["name"] == "云子姝"
         )
+        yun_zishu["referencePrompt"] = "【角色资产卡｜云子姝】按手绘3渲2固定四宫格规则生成"
+        yun_zishu["promptStandardSignature"] = (
+            "handpainted-3d2d|ming|2026-11-04.1"
+        )
         original_prompt = yun_zishu["referencePrompt"]
         yun_zishu["visualAnchor"] = "冷白肤色、素白中衣、长发凌乱、目光冷厉"
         yun_zishu["status"] = "confirmed"
@@ -708,7 +712,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert len(generated_yun_zishu["referenceImages"]) == 1
         generated_image = generated_yun_zishu["referenceImages"][0]
         assert generated_image["model"] == "tt-image-2.5"
-        assert generated_image["aspectRatio"] == "3:4"
+        assert generated_image["aspectRatio"] == "9:16"
         assert generated_image["resolution"] == "1K"
         assert generated_image["cost"] == 0.23
         assert generated_yun_zishu["primaryReferenceImageId"] == generated_image["id"]
@@ -957,6 +961,7 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
                 "name": "角色甲",
                 "status": "confirmed",
                 "referencePrompt": "角色甲完整提示词",
+                "promptStandardSignature": "live-action|auto|2026-11-04.1",
             },
             {
                 "id": second_asset_id,
@@ -964,6 +969,7 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
                 "name": "场景乙",
                 "status": "confirmed",
                 "referencePrompt": "场景乙完整提示词",
+                "promptStandardSignature": "live-action|auto|2026-11-04.1",
             },
         ]
         plan = {
@@ -973,7 +979,7 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
                     "assetKind": "character",
                     "name": "角色甲",
                     "prompt": "角色甲完整提示词",
-                    "aspectRatio": "3:4",
+                    "aspectRatio": "9:16",
                     "existingVersionCount": 0,
                 },
                 {

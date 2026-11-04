@@ -291,6 +291,7 @@ export interface AssetItem {
   visualAnchor: string;
   continuityNotes: string;
   referencePrompt: string;
+  promptStandardSignature: string;
   referenceImages: AssetImageVersion[];
   primaryReferenceImageId: string | null;
 }

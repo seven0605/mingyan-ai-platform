@@ -35,6 +35,8 @@ import {
   setPrimaryAssetReferenceImage,
 } from "../lib/api";
 import {
+  assetAspectRatio,
+  assetStandardSignature,
   COSTUME_ERA_OPTIONS,
   DEFAULT_ASSET_STANDARD,
   VISUAL_STANDARD_OPTIONS,
@@ -85,6 +87,10 @@ function itemReady(item: AssetItem) {
     && item.continuityNotes.trim()
     && item.referencePrompt.trim(),
   );
+}
+
+function promptUsesCurrentStandard(item: AssetItem, settings: AssetLibrary["standard"]) {
+  return item.promptStandardSignature === assetStandardSignature(settings);
 }
 
 function editableLibrarySignature(library: AssetLibrary | null) {
@@ -206,8 +212,12 @@ export function AssetWorkspace({
   const confirmedCount = library?.items.filter((item) => item.status === "confirmed").length ?? 0;
   const generatedCount = library?.items.filter((item) => item.referenceImages.length > 0).length ?? 0;
   const eligibleBatchItems = useMemo(
-    () => library?.items.filter((item) => item.status === "confirmed" && itemReady(item)) ?? [],
-    [library],
+    () => library?.items.filter((item) => (
+      item.status === "confirmed"
+      && itemReady(item)
+      && promptUsesCurrentStandard(item, activeStandard)
+    )) ?? [],
+    [activeStandard, library],
   );
   const selectedBatchItems = useMemo(() => {
     const selected = new Set(batchSelectedIds);
@@ -274,7 +284,15 @@ export function AssetWorkspace({
     setLibrary((current) => current ? {
       ...current,
       items: current.items.map((item) => (
-        item.id === selectedItem.id ? { ...item, [field]: value } : item
+        item.id === selectedItem.id
+          ? {
+              ...item,
+              [field]: value,
+              ...(["description", "visualAnchor", "continuityNotes", "referencePrompt"].includes(field)
+                ? { promptStandardSignature: "" }
+                : {}),
+            }
+          : item
       )),
     } : current);
   };
@@ -306,7 +324,12 @@ export function AssetWorkspace({
       ...current,
       items: current.items.map((item) => (
         item.id === selectedItem.id
-          ? { ...item, referencePrompt: promptPreview.compiled.prompt, status: "draft" }
+          ? {
+              ...item,
+              referencePrompt: promptPreview.compiled.prompt,
+              promptStandardSignature: assetStandardSignature(activeStandard),
+              status: "draft",
+            }
           : item
       )),
     } : current);
@@ -316,9 +339,15 @@ export function AssetWorkspace({
 
   const toggleConfirmation = () => {
     if (!selectedItem) return;
-    if (selectedItem.status === "draft" && !itemReady(selectedItem)) {
-      setError("请先补全说明、视觉锚点、连续性约束和生图提示词，再确认资产");
-      return;
+    if (selectedItem.status === "draft") {
+      if (!itemReady(selectedItem)) {
+        setError("请先补全说明、视觉锚点、连续性约束和生图提示词，再确认资产");
+        return;
+      }
+      if (!promptUsesCurrentStandard(selectedItem, activeStandard)) {
+        setError("请先预览并应用当前资产标准生成的完整提示词，再确认资产");
+        return;
+      }
     }
     setError(null);
     updateSelected(
@@ -709,6 +738,7 @@ export function AssetWorkspace({
                   <div className="asset-prompt-field">
                     <div className="asset-prompt-heading">
                       <label htmlFor={`asset-prompt-${selectedItem.id}`}>生图基础提示词</label>
+                      <span>{promptUsesCurrentStandard(selectedItem, activeStandard) ? "已按当前标准编译" : "待按当前标准重编"}</span>
                       <button type="button" onClick={handlePreviewPrompt}>
                         <Sparkles size={14} /> 预览标准化提示词
                       </button>
@@ -792,9 +822,15 @@ export function AssetWorkspace({
                       <button
                         className="button primary compact"
                         type="button"
-                        disabled={Boolean(generatingId) || settingPrimary || dirty || selectedItem.status !== "confirmed"}
+                        disabled={Boolean(generatingId) || settingPrimary || dirty || selectedItem.status !== "confirmed" || !promptUsesCurrentStandard(selectedItem, activeStandard)}
                         onClick={handleGenerate}
-                        title={dirty ? "请先保存资产修改" : selectedItem.status !== "confirmed" ? "请先确认资产" : "本操作会消耗一次生图额度"}
+                        title={dirty
+                          ? "请先保存资产修改"
+                          : selectedItem.status !== "confirmed"
+                            ? "请先确认资产"
+                            : !promptUsesCurrentStandard(selectedItem, activeStandard)
+                              ? "请先按当前资产标准重编提示词"
+                              : "本操作会消耗一次生图额度"}
                       >
                         {generatingId === selectedItem.id ? <LoaderCircle className="spinning" size={15} /> : <Sparkles size={15} />}
                         {generatingId === selectedItem.id
@@ -937,7 +973,9 @@ export function AssetWorkspace({
                     </header>
                     <div className="asset-batch-rows">
                       {library.items.map((item) => {
-                        const eligible = item.status === "confirmed" && itemReady(item);
+                        const eligible = item.status === "confirmed"
+                          && itemReady(item)
+                          && promptUsesCurrentStandard(item, activeStandard);
                         const selected = batchSelectedIds.includes(item.id);
                         const reviewed = reviewedSet.has(item.id);
                         return (
@@ -955,7 +993,11 @@ export function AssetWorkspace({
                             <button type="button" onClick={() => setBatchReviewId(item.id)}>
                               <span><strong>{item.name}</strong><small>{KIND_META[item.kind].label} · {item.referenceImages.length} 个现有版本</small></span>
                               <em>
-                                {!eligible ? "待确认" : selected ? (reviewed ? "已审查" : "待审查") : "未选择"}
+                                {!eligible
+                                  ? item.status === "confirmed" && !promptUsesCurrentStandard(item, activeStandard)
+                                    ? "提示词待重编"
+                                    : "待确认"
+                                  : selected ? (reviewed ? "已审查" : "待审查") : "未选择"}
                               </em>
                             </button>
                           </div>
@@ -970,7 +1012,7 @@ export function AssetWorkspace({
                         <header>
                           <div>
                             <strong>{batchReviewItem.name}</strong>
-                            <span>{KIND_META[batchReviewItem.kind].label}资产 · {batchReviewItem.kind === "character" ? "3:4" : batchReviewItem.kind === "scene" ? "16:9" : "1:1"} · 1K</span>
+                            <span>{KIND_META[batchReviewItem.kind].label}资产 · {assetAspectRatio(activeStandard.visualStandard, batchReviewItem.kind)} · 1K</span>
                           </div>
                           <span className={reviewedSet.has(batchReviewItem.id) ? "reviewed" : ""}>
                             {reviewedSet.has(batchReviewItem.id) ? "已完成审查" : "等待审查"}
