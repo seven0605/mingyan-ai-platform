@@ -193,7 +193,7 @@ class TemporaryAssetTunnel:
             return self._served_request_count
 
     def verify_urls(
-        self, urls: Mapping[str, str], *, timeout_seconds: float = 60
+        self, urls: Mapping[str, str], *, timeout_seconds: float = 120
     ) -> None:
         if not urls:
             raise ValueError("没有可验证的参考素材")
