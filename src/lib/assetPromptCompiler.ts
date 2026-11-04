@@ -192,23 +192,69 @@ const DETAILED_ERA_RULES: Partial<Record<CostumeEra, string>> = {
   ming: "明代男性服饰：便服与朝服严格区分；按身份选择圆领袍、补服等形制，乌纱帽、补子、玉带銙只在官阶成立时使用，男性可按身份使用网巾。禁止清代旗袍与马蹄袖。",
 };
 
+const MING_FEMALE_RULE = "明代女性服饰：按身份与场合选择直领大襟（交领）短袄或对襟衫袄，下配马面裙；可按身份罩方领对襟比甲。皇室与高等级女性可使用暗花、织金或妆花丝织物，侍女与平民降低纹样密度、材质与饱和度。发式盘髻并按身份配置簪钗；凤冠、霞帔等礼服组件只在符合身份的正式礼仪场合使用，日常造型不得滥用。禁止清代旗装、马蹄袖、晚清多重滚边、西式束腰与现代影楼古装。";
+
 function sourceLine(label: string, value: string) {
   return `${label}：${value.trim() || "待补充"}`;
 }
 
-function specificDetails(item: AssetItem) {
+function isLikelyFemale(item: AssetItem) {
+  const identity = item.description.split("；")[0] ?? "";
+  return /女|公主|夫人|小姐|王妃|皇后|妃|妻|妾|母|婆子|丫鬟|宫婢/.test(
+    `${item.name} ${identity} ${item.visualAnchor}`,
+  );
+}
+
+function primaryCharacterAppearance(item: AssetItem, settings: AssetStandardSettings) {
+  if (item.kind !== "character") return null;
+  const weights: Array<[string, number]> = [
+    ["宫装", 10], ["褙子", 9], ["锦袍", 8], ["劲装", 8], ["黑袍", 8],
+    ["官服", 7], ["长袍", 6], ["长裙", 6], ["白衣", 5], ["衣", 2],
+    ["发髻", 3], ["束发", 3], ["冠", 3], ["腰带", 2], ["佩", 1],
+  ];
+  const candidates = item.visualAnchor.split(/[；;]/).map((value) => value.trim()).filter(Boolean);
+  const selected = candidates
+    .map((value) => ({
+      value,
+      score: weights.reduce((total, [keyword, weight]) => total + (value.includes(keyword) ? weight : 0), 0)
+        - (/手腕|侧脸|掌印|眼眸|被掌掴/.test(value) ? 8 : 0),
+    }))
+    .sort((left, right) => right.score - left.score || right.value.length - left.value.length)[0]?.value ?? null;
+  if (selected && settings.costumeEra === "ming" && isLikelyFemale(item) && selected.includes("宫装")) {
+    return `${item.name}（明代皇室贵族日常正装：素白暗金织纹直领大襟短袄，配同色马面裙，盘髻配克制金簪与垂珠耳饰，气度尊贵清冷；非婚礼礼服，不用凤冠霞帔）`;
+  }
+  if (selected && settings.costumeEra === "ming" && !isLikelyFemale(item)) {
+    return selected.replace("束发金冠", "束发先罩黑色网巾，外配简洁黑色明代巾冠；绝对不得金属冠、金冠或玄幻发冠");
+  }
+  return selected;
+}
+
+function finalComplianceLock(item: AssetItem) {
+  if (item.kind === "character") {
+    return "【生成前最终硬锁｜不得违反】必须严格生成单张9:16竖版2×2四宫格：左上仅正面头肩；右上仅标准90度侧面头肩；左下画面上边缘从锁骨以下开始，整个头、头发、脸、下巴和颈部上段必须完全在画外，绝对不得露脸；右下必须头脚完整、完全背面、绝不回头。四格必须同一人物、同一张脸、同一套服装、同一妆发，禁止四个不同人物。";
+  }
+  if (item.kind === "scene") {
+    return "【生成前最终硬锁｜不得违反】必须是单张16:9同一场景五视图：正、反、左、右四个无人透视图，加一个黑白线稿顶视平面图；禁止任何人物、人体、服装和动作。";
+  }
+  return "【生成前最终硬锁｜不得违反】必须是单张9:16同一道具四宫格：上排两个不同局部特写，下排两个完整不同角度；禁止人物、人手、人体部位和四个不同道具。";
+}
+
+function specificDetails(item: AssetItem, settings: AssetStandardSettings) {
+  const collectiveCharacter = item.kind === "character" && /们|众|护卫|侍女/.test(item.name);
+  const primaryAppearance = primaryCharacterAppearance(item, settings);
   const selectionRule = item.kind === "scene"
     ? "内容取舍：下列剧情文本只用于判断场景功能、空间关系、陈设、材质与光线；忽略并禁止呈现其中的任何人物、人体、服装、动作和表演。无人场景规则优先级最高。"
     : item.kind === "prop"
       ? "内容取舍：下列剧情文本只用于判断道具功能、尺寸、结构、材质、工艺与磨损；忽略并禁止呈现持有者、人物、人手、人体、动作和场景表演。纯物品规则优先级最高。"
-      : "内容取舍：只补充该角色本人的身份、外形、服装、材质与固定识别锚点，不把其他人物或场景混入资产卡。";
+      : `内容取舍：只补充该角色本人的身份、外形、服装、材质与固定识别锚点，不把其他人物或场景混入资产卡。若资料出现多套服装，只选择身份辨识度最高的一套主造型，四格不得混搭寝衣、常服、礼服或不同剧情阶段。主造型锁定与历史服饰补充层的优先级高于下方原始视觉锚点，冲突细节必须忽略。${collectiveCharacter ? "该名称代表群体职能，本卡只展示一名标准代表个体，禁止多人群像。" : ""}`;
   return [
     "【本资产具体细节】",
     selectionRule,
+    primaryAppearance ? `主造型锁定（四格唯一服装与妆发）：${primaryAppearance}` : null,
     sourceLine("剧本说明", item.description),
     sourceLine("视觉锚点", item.visualAnchor),
     sourceLine("连续性约束", item.continuityNotes),
-  ].join("\n");
+  ].filter((line): line is string => Boolean(line)).join("\n");
 }
 
 function costumeLayer(item: AssetItem, settings: AssetStandardSettings) {
@@ -228,17 +274,23 @@ function costumeLayer(item: AssetItem, settings: AssetStandardSettings) {
     };
   }
   if (item.kind !== "character") {
+    const contextRule = settings.costumeEra === "ming"
+      ? item.kind === "scene"
+        ? "建筑、家具、照明和生活陈设锁定明代语境，结构与工艺服从场景身份和功能；禁止清代装饰体系、西式家具、现代灯具与现代材料。"
+        : "器物的结构、纹样、材料和工艺锁定明代语境，按用途选择木、漆、铁、铜、瓷、玉、织物等合理材质；禁止清代制式、西式工业件与现代零件。"
+      : "不得擅自混入其他朝代的标志性结构、工艺或器物。";
     return {
-      rule: `时代语境锁定为${era.label}代；服饰训练资料只用于人物服饰，不能套到无人场景或纯道具。`,
+      rule: `时代语境锁定为${era.label}代；服饰训练资料只用于人物服饰，不能套到无人场景或纯道具。${contextRule}`,
       warning: null,
       eraLabel: era.label,
     };
   }
-  const likelyFemale = /女|公主|夫人|小姐|王妃|皇后|妃|妻/.test(
-    `${item.name} ${item.description} ${item.visualAnchor}`,
-  );
+  const likelyFemale = isLikelyFemale(item);
   const rule = DETAILED_ERA_RULES[settings.costumeEra];
   if (rule && !likelyFemale) return { rule, warning: null, eraLabel: era.label };
+  if (settings.costumeEra === "ming" && likelyFemale) {
+    return { rule: MING_FEMALE_RULE, warning: null, eraLabel: era.label };
+  }
   if (rule) {
     return {
       rule: `时代锁定为${era.label}代。现有训练资料是男性角色规范，不能套到该女性角色；女性服饰形制、发髻、品色与配饰必须另行补充考据。`,
@@ -264,11 +316,16 @@ export function compileAssetPrompt(item: AssetItem, settings: AssetStandardSetti
     `【${kindLabel}资产卡｜${item.name}】`,
     `【固定模板】\n${template}`,
     costume.rule ? `【历史与服饰补充层】\n${costume.rule}` : null,
-    specificDetails(item),
+    specificDetails(item, settings),
+    finalComplianceLock(item),
   ].filter((section): section is string => Boolean(section)).join("\n\n");
+  const warnings = costume.warning ? [costume.warning] : [];
+  if (item.kind === "character" && !primaryCharacterAppearance(item, settings)) {
+    warnings.push("该人物缺少可锁定的主造型视觉锚点，补全前不应进入生图队列。");
+  }
   return {
     prompt,
-    warnings: costume.warning ? [costume.warning] : [],
+    warnings,
     standardLabel: standard.label,
     eraLabel: costume.eraLabel,
   };

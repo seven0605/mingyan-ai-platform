@@ -659,7 +659,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         )
         yun_zishu["referencePrompt"] = "【角色资产卡｜云子姝】按手绘3渲2固定四宫格规则生成"
         yun_zishu["promptStandardSignature"] = (
-            "handpainted-3d2d|ming|2026-11-04.1"
+            "handpainted-3d2d|ming|2026-11-04.6"
         )
         original_prompt = yun_zishu["referencePrompt"]
         yun_zishu["visualAnchor"] = "冷白肤色、素白中衣、长发凌乱、目光冷厉"
@@ -961,7 +961,7 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
                 "name": "角色甲",
                 "status": "confirmed",
                 "referencePrompt": "角色甲完整提示词",
-                "promptStandardSignature": "live-action|auto|2026-11-04.1",
+                "promptStandardSignature": "live-action|auto|2026-11-04.6",
             },
             {
                 "id": second_asset_id,
@@ -969,7 +969,7 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
                 "name": "场景乙",
                 "status": "confirmed",
                 "referencePrompt": "场景乙完整提示词",
-                "promptStandardSignature": "live-action|auto|2026-11-04.1",
+                "promptStandardSignature": "live-action|auto|2026-11-04.6",
             },
         ]
         plan = {

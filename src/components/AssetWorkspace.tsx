@@ -211,6 +211,9 @@ export function AssetWorkspace({
   ) ?? COSTUME_ERA_OPTIONS[0];
   const confirmedCount = library?.items.filter((item) => item.status === "confirmed").length ?? 0;
   const generatedCount = library?.items.filter((item) => item.referenceImages.length > 0).length ?? 0;
+  const stalePromptCount = library?.items.filter(
+    (item) => !promptUsesCurrentStandard(item, activeStandard),
+  ).length ?? 0;
   const eligibleBatchItems = useMemo(
     () => library?.items.filter((item) => (
       item.status === "confirmed"
@@ -334,6 +337,23 @@ export function AssetWorkspace({
       )),
     } : current);
     setPromptPreview(null);
+    setError(null);
+  };
+
+  const handleApplyAllPrompts = () => {
+    if (!library || !stalePromptCount) return;
+    const signature = assetStandardSignature(activeStandard);
+    setLibrary({
+      ...library,
+      items: library.items.map((item) => ({
+        ...item,
+        referencePrompt: compileAssetPrompt(item, activeStandard).prompt,
+        promptStandardSignature: signature,
+        status: "draft",
+      })),
+    });
+    setPromptPreview(null);
+    setBatchPlan((current) => current ? { ...current, current: false } : current);
     setError(null);
   };
 
@@ -568,6 +588,16 @@ export function AssetWorkspace({
               <button className="button secondary compact" type="button" disabled={extracting || dirty} onClick={handleExtract}>
                 {extracting ? <LoaderCircle className="spinning" size={15} /> : <RefreshCw size={15} />}
                 重新整理
+              </button>
+              <button
+                className="button secondary compact"
+                type="button"
+                disabled={!stalePromptCount}
+                onClick={handleApplyAllPrompts}
+                title="按当前视觉标准和朝代重编人物、场景与物品提示词；所有资产会恢复为待确认"
+              >
+                <Sparkles size={15} />
+                {stalePromptCount ? `重编全部提示词 ${stalePromptCount}` : "提示词已是当前标准"}
               </button>
               <button
                 className="button secondary compact"

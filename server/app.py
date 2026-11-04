@@ -392,7 +392,7 @@ class AssetStandardSettings(BaseModel):
     ] = "auto"
 
 
-ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.1"
+ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.6"
 
 
 def asset_standard_signature(settings: AssetStandardSettings) -> str:

@@ -24,7 +24,7 @@ export const DEFAULT_ASSET_STANDARD: AssetStandardSettings = {
   costumeEra: "auto",
 };
 
-export const ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.1";
+export const ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.6";
 
 export function assetStandardSignature(settings: AssetStandardSettings) {
   return `${settings.visualStandard}|${settings.costumeEra}|${ASSET_PROMPT_TEMPLATE_VERSION}`;
