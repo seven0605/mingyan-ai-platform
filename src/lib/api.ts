@@ -15,6 +15,7 @@ import type {
   StoryAnalysis,
   TextModelConnection,
   TextModelSettings,
+  VideoProductionPlan,
 } from "../types";
 
 interface NewProjectInput {
@@ -275,4 +276,15 @@ export function setPrimaryAssetReferenceImage(
     `/api/projects/${projectId}/assets/${assetId}/images/${imageId}/primary`,
     { method: "PUT" },
   );
+}
+
+export function getVideoProductionPlan(projectId: string) {
+  return request<VideoProductionPlan>(`/api/projects/${projectId}/video-plan`);
+}
+
+export function confirmVideoProductionPlan(projectId: string, itemIds: string[]) {
+  return request<VideoProductionPlan>(`/api/projects/${projectId}/video-plan`, {
+    method: "POST",
+    body: JSON.stringify({ itemIds }),
+  });
 }

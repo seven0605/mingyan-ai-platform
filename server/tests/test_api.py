@@ -225,10 +225,13 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             request_payload = json.loads(request.content)
             image_requests.append(request_payload)
             assert request_payload["model"] == "tt-image-2.5"
-            assert "云子姝" in request_payload["prompt"]
+            assert any(name in request_payload["prompt"] for name in ("云子姝", "萧云衡"))
             assert request_payload["params"]["aspect_ratio"] == "9:16"
             assert request_payload["params"]["resolution"] == "1K"
-            if len(image_requests) == 1:
+            yun_request_count = sum(
+                "云子姝" in item["prompt"] for item in image_requests
+            )
+            if "萧云衡" in request_payload["prompt"] or yun_request_count == 1:
                 assert "images" not in request_payload["params"]
             else:
                 assert request_payload["params"]["images"][0].startswith(
@@ -845,6 +848,55 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             item for item in preserved_assets["items"] if item["name"] == "云子姝"
         )["visualAnchor"] == "冷白肤色、素白中衣、长发凌乱、目光冷厉"
 
+        video_assets = client.get(f"/api/projects/{project['id']}/assets").json()
+        xiao_yunheng = next(
+            item for item in video_assets["items"] if item["name"] == "萧云衡"
+        )
+        xiao_yunheng["status"] = "confirmed"
+        xiao_yunheng["description"] = "身着玄色将军服的青年将军"
+        xiao_yunheng["visualAnchor"] = "冷峻面容、玄色将军服、束发金冠"
+        xiao_yunheng["continuityNotes"] = "脸型、五官、服装纹样保持一致"
+        xiao_yunheng["referencePrompt"] = "【角色资产卡｜萧云衡】完整提示词"
+        xiao_yunheng["promptStandardSignature"] = (
+            "handpainted-3d2d|ming|2026-11-04.8"
+        )
+        saved_video_assets = client.put(
+            f"/api/projects/{project['id']}/assets",
+            json={
+                "items": video_assets["items"],
+                "standard": video_assets["standard"],
+            },
+        )
+        assert saved_video_assets.status_code == 200
+        assert client.post(
+            f"/api/projects/{project['id']}/assets/{xiao_yunheng_id}/images"
+        ).status_code == 200
+
+        video_plan = client.get(f"/api/projects/{project['id']}/video-plan")
+        assert video_plan.status_code == 200
+        assert len(video_plan.json()["items"]) == 8
+        assert all(item["ready"] for item in video_plan.json()["items"])
+        assert all(
+            len(item["assetReferences"]) >= 2
+            for item in video_plan.json()["items"]
+        )
+        selected_video_ids = [item["id"] for item in video_plan.json()["items"][:2]]
+        confirmed_video_plan = client.post(
+            f"/api/projects/{project['id']}/video-plan",
+            json={"itemIds": selected_video_ids},
+        )
+        assert confirmed_video_plan.status_code == 200
+        assert confirmed_video_plan.json()["current"] is True
+        assert confirmed_video_plan.json()["selectedItemIds"] == selected_video_ids
+        assert client.get("/api/projects").json()[0]["stage"] == "video"
+
+        assert client.put(
+            f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images/{generated_image['id']}/primary"
+        ).status_code == 200
+        assert client.get(f"/api/projects/{project['id']}/video-plan").json()[
+            "current"
+        ] is False
+
     database_bytes = (tmp_path / "mingyan.sqlite3").read_bytes()
     assert b"secret-not-for-sqlite" not in database_bytes
     assert b"image-secret-not-for-sqlite" not in database_bytes
@@ -859,7 +911,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         projects = client.get("/api/projects").json()
         assert len(projects) == 1
         assert projects[0]["name"] == "跨平台测试"
-        assert projects[0]["stage"] == "assets"
+        assert projects[0]["stage"] == "video"
         source = client.get(f"/api/projects/{projects[0]['id']}/source").json()
         assert source["title"] == "测试原文"
         assert source["chapterCount"] == 2
@@ -886,16 +938,21 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         )
         assert restored_yun_zishu["status"] == "confirmed"
         assert len(restored_yun_zishu["referenceImages"]) == 2
-        assert restored_yun_zishu["primaryReferenceImageId"] == second_image["id"]
+        assert restored_yun_zishu["primaryReferenceImageId"] == generated_image["id"]
         assert client.get(restored_yun_zishu["referenceImages"][0]["url"]).status_code == 200
         restored_tasks = client.get(f"/api/projects/{projects[0]['id']}/tasks").json()
-        assert len(restored_tasks) == 2
+        assert len(restored_tasks) == 3
         assert all(task["status"] == "completed" for task in restored_tasks)
         restored_batch_plan = client.get(
             f"/api/projects/{projects[0]['id']}/assets/batch-plan"
         ).json()
-        assert restored_batch_plan["current"] is True
+        assert restored_batch_plan["current"] is False
         assert restored_batch_plan["items"][0]["name"] == "云子姝"
+        restored_video_plan = client.get(
+            f"/api/projects/{projects[0]['id']}/video-plan"
+        ).json()
+        assert restored_video_plan["selectedItemIds"] == selected_video_ids
+        assert restored_video_plan["current"] is False
         settings = client.get("/api/settings/text-model").json()
         assert settings["configured"] is True
         assert settings["model"] == "example-chat"

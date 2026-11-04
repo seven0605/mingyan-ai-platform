@@ -10,6 +10,7 @@ import {
   PackageOpen,
   PanelTop,
   Plug,
+  Video,
 } from "lucide-react";
 import type { ComponentType } from "react";
 import type { PageId } from "../types";
@@ -26,6 +27,7 @@ const NAVIGATION: NavigationItem[] = [
   { id: "source", label: "原文与剧本", icon: FileText },
   { id: "storyboard", label: "分镜工作台", icon: Clapperboard },
   { id: "assets", label: "角色·场景·物品", icon: Boxes },
+  { id: "video", label: "视频生成", icon: Video },
   { id: "prompts", label: "提示词模板", icon: PanelTop },
   { id: "tasks", label: "任务中心", icon: FolderKanban, dividerBefore: true },
   { id: "plugins", label: "插件管理", icon: Plug },

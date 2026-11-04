@@ -8,6 +8,7 @@ import { SourceEditor } from "./components/SourceEditor";
 import { StoryboardWorkspace } from "./components/StoryboardWorkspace";
 import { TaskCenter } from "./components/TaskCenter";
 import { TopBar } from "./components/TopBar";
+import { VideoWorkspace } from "./components/VideoWorkspace";
 import { Workspace } from "./components/Workspace";
 import { useProjects } from "./hooks/useProjects";
 import { getImageModelSettings, getTextModelSettings } from "./lib/api";
@@ -16,6 +17,7 @@ import type { ImageModelSettings, PageId, TextModelSettings } from "./types";
 const PAGE_TITLES: Record<Exclude<PageId, "workspace" | "source">, string> = {
   storyboard: "分镜工作台",
   assets: "角色 · 场景 · 物品",
+  video: "视频生成",
   prompts: "提示词模板",
   tasks: "任务中心",
   plugins: "插件管理",
@@ -117,6 +119,13 @@ export default function App() {
             onOpenApiSettings={() => setActivePage("api")}
             onAssetsReady={() => updateStage("assets")}
             imageModelConfigured={imageModelSettings?.configured ?? false}
+          />
+        ) : activePage === "video" ? (
+          <VideoWorkspace
+            project={currentProject}
+            onBack={() => setActivePage("workspace")}
+            onOpenAssets={() => setActivePage("assets")}
+            onPlanReady={() => updateStage("video")}
           />
         ) : activePage === "tasks" ? (
           <TaskCenter

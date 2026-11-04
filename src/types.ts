@@ -3,6 +3,7 @@ export type PageId =
   | "source"
   | "storyboard"
   | "assets"
+  | "video"
   | "prompts"
   | "tasks"
   | "plugins"
@@ -325,6 +326,41 @@ export interface AssetBatchPlan {
   confirmedAt: string;
   current: boolean;
   updatedAt: string;
+}
+
+export interface VideoPlanAssetReference {
+  assetId: string;
+  kind: AssetKind;
+  name: string;
+  imageId: string;
+  imageUrl: string;
+  direct: boolean;
+}
+
+export interface VideoProductionPlanItem {
+  id: string;
+  episodeNumber: number;
+  episodeTitle: string;
+  groupIndex: number;
+  sceneIndex: number;
+  durationSeconds: number;
+  aspectRatio: StoryboardAspectRatio;
+  targetModel: StoryboardTargetModel;
+  purpose: string;
+  prompt: string;
+  assetReferences: VideoPlanAssetReference[];
+  blockingReasons: string[];
+  ready: boolean;
+}
+
+export interface VideoProductionPlan {
+  projectId: string;
+  items: VideoProductionPlanItem[];
+  selectedItemIds: string[];
+  storyboardUpdatedAt: string;
+  assetLibraryUpdatedAt: string;
+  current: boolean;
+  confirmedAt: string | null;
 }
 
 export type ProjectTaskStatus = "queued" | "running" | "completed" | "failed" | "interrupted";

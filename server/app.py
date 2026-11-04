@@ -469,6 +469,56 @@ class AssetBatchPlanOut(AssetBatchPlanPayload):
     updatedAt: str
 
 
+class VideoPlanAssetReference(BaseModel):
+    assetId: str
+    kind: Literal["character", "scene", "prop"]
+    name: str
+    imageId: str
+    imageUrl: str
+    direct: bool
+
+
+class VideoProductionPlanItem(BaseModel):
+    id: str
+    episodeNumber: int
+    episodeTitle: str
+    groupIndex: int
+    sceneIndex: int
+    durationSeconds: int
+    aspectRatio: Literal["16:9", "9:16"]
+    targetModel: Literal["seedance-2.0", "sora-2", "kling-3.0", "veo-3.1"]
+    purpose: str
+    prompt: str
+    assetReferences: list[VideoPlanAssetReference]
+    blockingReasons: list[str]
+    ready: bool
+
+
+class VideoPlanConfirm(BaseModel):
+    itemIds: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("itemIds")
+    @classmethod
+    def validate_item_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("视频生产清单不能包含重复镜头组")
+        return values
+
+
+class VideoPlanSelectionPayload(BaseModel):
+    selectedItemIds: list[str]
+
+
+class VideoProductionPlanOut(BaseModel):
+    projectId: str
+    items: list[VideoProductionPlanItem]
+    selectedItemIds: list[str]
+    storyboardUpdatedAt: str
+    assetLibraryUpdatedAt: str
+    current: bool
+    confirmedAt: str | None = None
+
+
 class ProjectTaskOut(BaseModel):
     id: str
     projectId: str
@@ -639,6 +689,18 @@ def initialize_database(database_path: Path) -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS video_production_plans (
+                project_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                storyboard_updated_at TEXT NOT NULL,
+                asset_library_updated_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """
+        )
         screenplay_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(project_screenplays)").fetchall()
@@ -748,6 +810,90 @@ def row_to_asset_batch_plan(
         updatedAt=row["updated_at"],
         **payload.model_dump(),
     )
+
+
+def build_video_plan_items(
+    storyboard_rows: list[sqlite3.Row], asset_row: sqlite3.Row
+) -> tuple[list[VideoProductionPlanItem], str, str]:
+    library = AssetLibraryPayload.model_validate(json.loads(asset_row["payload"]))
+    storyboard_updated_at = max(row["updated_at"] for row in storyboard_rows)
+    asset_library_updated_at = asset_row["updated_at"]
+    library_matches_storyboard = (
+        asset_row["storyboard_updated_at"] == storyboard_updated_at
+    )
+    items: list[VideoProductionPlanItem] = []
+    for row in storyboard_rows:
+        storyboard = row_to_storyboard(row)
+        for group in storyboard.groups:
+            search_text = "\n".join(
+                [
+                    *group.subjects,
+                    group.sceneDescription,
+                    group.videoPrompt,
+                    group.metadata,
+                    group.keyDialogue,
+                ]
+            )
+            appearance = (
+                f"第 {storyboard.episodeNumber} 集 · 第 {group.sceneIndex} 场"
+            )
+            references: list[VideoPlanAssetReference] = []
+            blocking_reasons: list[str] = []
+            for asset in library.items:
+                direct = bool(asset.name.strip() and asset.name in search_text)
+                contextual = (
+                    asset.kind == "scene" and appearance in asset.appearances
+                )
+                if not direct and not contextual:
+                    continue
+                primary = next(
+                    (
+                        image
+                        for image in asset.referenceImages
+                        if image.id == asset.primaryReferenceImageId
+                    ),
+                    asset.referenceImages[0] if asset.referenceImages else None,
+                )
+                if direct and asset.status != "confirmed":
+                    blocking_reasons.append(f"{asset.name} 尚未确认")
+                elif direct and primary is None:
+                    blocking_reasons.append(f"{asset.name} 缺少主参考图")
+                if primary is not None and asset.status == "confirmed":
+                    references.append(
+                        VideoPlanAssetReference(
+                            assetId=asset.id,
+                            kind=asset.kind,
+                            name=asset.name,
+                            imageId=primary.id,
+                            imageUrl=primary.url,
+                            direct=direct,
+                        )
+                    )
+            if not group.videoPrompt.strip():
+                blocking_reasons.append("视频提示词为空")
+            if not references:
+                blocking_reasons.append("没有可用的已确认资产主参考图")
+            if not library_matches_storyboard:
+                blocking_reasons.append("分镜已更新，请重新整理资产库")
+            blocking_reasons = unique_strings(blocking_reasons)
+            items.append(
+                VideoProductionPlanItem(
+                    id=f"e{storyboard.episodeNumber}-g{group.index}",
+                    episodeNumber=storyboard.episodeNumber,
+                    episodeTitle=storyboard.episodeTitle,
+                    groupIndex=group.index,
+                    sceneIndex=group.sceneIndex,
+                    durationSeconds=group.durationSeconds,
+                    aspectRatio=storyboard.aspectRatio,
+                    targetModel=storyboard.targetModel,
+                    purpose=group.purpose,
+                    prompt=group.videoPrompt,
+                    assetReferences=references,
+                    blockingReasons=blocking_reasons,
+                    ready=not blocking_reasons,
+                )
+            )
+    return items, storyboard_updated_at, asset_library_updated_at
 
 
 def asset_library_tasks(row: sqlite3.Row) -> list[ProjectTaskOut]:
@@ -2812,6 +2958,137 @@ def create_app(
                 (project_id, episode_number),
             ).fetchone()
         return row_to_storyboard(saved)
+
+    def video_plan_inputs(
+        project_id: str,
+    ) -> tuple[list[sqlite3.Row], sqlite3.Row, sqlite3.Row | None]:
+        with connect(database_path) as connection:
+            project_row = connection.execute(
+                "SELECT id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            screenplay_row = connection.execute(
+                "SELECT * FROM project_screenplays WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            storyboard_rows = connection.execute(
+                """
+                SELECT * FROM project_storyboards
+                WHERE project_id = ? ORDER BY episode_number
+                """,
+                (project_id,),
+            ).fetchall()
+            asset_row = connection.execute(
+                "SELECT * FROM project_assets WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            saved_plan = connection.execute(
+                "SELECT * FROM video_production_plans WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if project_row is None:
+            raise HTTPException(status_code=404, detail="项目不存在")
+        if screenplay_row is None or screenplay_row["status"] != "approved":
+            raise HTTPException(status_code=409, detail="请先完成人工确认剧本")
+        if not storyboard_rows:
+            raise HTTPException(status_code=409, detail="请先生成至少一集分镜")
+        if any(
+            row["screenplay_updated_at"] != screenplay_row["updated_at"]
+            for row in storyboard_rows
+        ):
+            raise HTTPException(status_code=409, detail="剧本已更新，请重新生成分镜")
+        if asset_row is None:
+            raise HTTPException(status_code=409, detail="请先建立一致性资产库")
+        return storyboard_rows, asset_row, saved_plan
+
+    @application.get(
+        "/api/projects/{project_id}/video-plan",
+        response_model=VideoProductionPlanOut,
+    )
+    def get_video_production_plan(project_id: str) -> VideoProductionPlanOut:
+        storyboard_rows, asset_row, saved_plan = video_plan_inputs(project_id)
+        items, storyboard_updated_at, asset_library_updated_at = (
+            build_video_plan_items(storyboard_rows, asset_row)
+        )
+        current = bool(
+            saved_plan
+            and saved_plan["storyboard_updated_at"] == storyboard_updated_at
+            and saved_plan["asset_library_updated_at"] == asset_library_updated_at
+        )
+        selection = (
+            VideoPlanSelectionPayload.model_validate(json.loads(saved_plan["payload"]))
+            if saved_plan
+            else VideoPlanSelectionPayload(selectedItemIds=[])
+        )
+        item_ids = {item.id for item in items}
+        return VideoProductionPlanOut(
+            projectId=project_id,
+            items=items,
+            selectedItemIds=[
+                item_id for item_id in selection.selectedItemIds if item_id in item_ids
+            ],
+            storyboardUpdatedAt=storyboard_updated_at,
+            assetLibraryUpdatedAt=asset_library_updated_at,
+            current=current,
+            confirmedAt=saved_plan["updated_at"] if saved_plan else None,
+        )
+
+    @application.post(
+        "/api/projects/{project_id}/video-plan",
+        response_model=VideoProductionPlanOut,
+    )
+    def confirm_video_production_plan(
+        project_id: str, payload: VideoPlanConfirm
+    ) -> VideoProductionPlanOut:
+        storyboard_rows, asset_row, _ = video_plan_inputs(project_id)
+        items, storyboard_updated_at, asset_library_updated_at = (
+            build_video_plan_items(storyboard_rows, asset_row)
+        )
+        items_by_id = {item.id: item for item in items}
+        for item_id in payload.itemIds:
+            item = items_by_id.get(item_id)
+            if item is None:
+                raise HTTPException(status_code=404, detail="生产清单包含不存在的镜头组")
+            if not item.ready:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"第 {item.episodeNumber} 集镜头组 {item.groupIndex} 尚未就绪",
+                )
+        now = utc_now()
+        selection = VideoPlanSelectionPayload(selectedItemIds=payload.itemIds)
+        with connect(database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO video_production_plans (
+                    project_id, payload, storyboard_updated_at,
+                    asset_library_updated_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    storyboard_updated_at = excluded.storyboard_updated_at,
+                    asset_library_updated_at = excluded.asset_library_updated_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    project_id,
+                    selection.model_dump_json(),
+                    storyboard_updated_at,
+                    asset_library_updated_at,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE projects SET stage = 'video', updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+        return VideoProductionPlanOut(
+            projectId=project_id,
+            items=items,
+            selectedItemIds=payload.itemIds,
+            storyboardUpdatedAt=storyboard_updated_at,
+            assetLibraryUpdatedAt=asset_library_updated_at,
+            current=True,
+            confirmedAt=now,
+        )
 
     @application.get(
         "/api/projects/{project_id}/assets", response_model=AssetLibraryOut | None
