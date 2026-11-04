@@ -2254,6 +2254,7 @@ def create_app(
                         files[logical_id] = image_path
                     reference_urls = asset_tunnel.start(job["project_id"], files)
                     tunnel_started = True
+                    asset_tunnel.verify_urls(reference_urls)
                     ordered_urls = [
                         reference_urls[str(reference["logicalId"])]
                         for reference in references
@@ -2279,10 +2280,10 @@ def create_app(
                             "model": job["model"],
                             "prompt": (
                                 f"【参考图顺序锁定】{reference_guide}。"
-                                "人物身份以身份母版为最高优先级；服装、发型、伤势与情绪只读取对应镜头状态图；"
+                                "人物身份以身份母版为最高优先级；服装、发型、身体状态与情绪只读取对应镜头状态图；"
                                 "场景以对应场景参考图为准；"
                                 "同名人物跨镜头组必须保持同一身份，仅允许服装、发型、"
-                                "伤势和情绪状态变化。\n\n"
+                                "身体状态和情绪变化。\n\n"
                                 f"{job['prompt']}"
                             ),
                             "seconds": str(job["seconds"]),
@@ -2435,6 +2436,7 @@ def create_app(
             httpx.RequestError,
             sqlite3.Error,
             OSError,
+            RuntimeError,
             ValueError,
             KeyError,
         ) as error:

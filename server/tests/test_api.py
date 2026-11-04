@@ -32,6 +32,7 @@ class FakeAssetTunnel:
         self.project_id: str | None = None
         self.running = False
         self.start_count = 0
+        self.verify_count = 0
 
     def cloudflared_path(self) -> Path:
         return Path("/fake/cloudflared")
@@ -59,6 +60,11 @@ class FakeAssetTunnel:
     def stop(self) -> None:
         self.running = False
         self.project_id = None
+
+    def verify_urls(self, urls: dict[str, str]) -> None:
+        assert urls
+        assert all(url.startswith("https://") for url in urls.values())
+        self.verify_count += 1
 
     def served_request_count(self) -> int:
         return 1
@@ -115,7 +121,8 @@ def test_temporary_asset_gateway_only_serves_whitelisted_files(tmp_path: Path) -
         assert response.headers["cache-control"] == "private, no-store"
         assert response.content.endswith(b"public-test")
         assert httpx.head(urls["allowed"]).status_code == 200
-        assert tunnel.served_request_count() == 2
+        tunnel.verify_urls(urls, timeout_seconds=1)
+        assert tunnel.served_request_count() == 3
         local_root = urls["allowed"].split("/media/", 1)[0]
         assert httpx.get(f"{local_root}/api/projects").status_code == 404
         assert httpx.get(f"{local_root}/media/wrong-token/hidden.png").status_code == 404
@@ -382,6 +389,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             assert "用于e1-g2" in request_payload["prompt"]
             assert "同名人物跨镜头组必须保持同一身份" in request_payload["prompt"]
             assert "身份母版为最高优先级" in request_payload["prompt"]
+            assert "服装、发型、身体状态与情绪" in request_payload["prompt"]
             assert request_payload["size"] == "1280x720"
             reference_urls = request_payload["metadata"]["__workbench_refs"][
                 "reference_image_urls"
@@ -1180,6 +1188,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert queued_videos.json()[0]["title"].endswith("镜头组 1–2（30秒）")
         assert len(video_requests) == 1
         assert fake_tunnel.start_count == 1
+        assert fake_tunnel.verify_count == 1
         assert fake_tunnel.running is False
         video_tasks = [
             task

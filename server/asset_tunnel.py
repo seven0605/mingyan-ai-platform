@@ -12,7 +12,9 @@ import subprocess
 import threading
 import time
 from typing import Mapping
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 
 TUNNEL_URL_PATTERN = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
@@ -189,6 +191,55 @@ class TemporaryAssetTunnel:
     def served_request_count(self) -> int:
         with self._lock:
             return self._served_request_count
+
+    def verify_urls(
+        self, urls: Mapping[str, str], *, timeout_seconds: float = 60
+    ) -> None:
+        if not urls:
+            raise ValueError("没有可验证的参考素材")
+        deadline = time.monotonic() + timeout_seconds
+        first_id, first_url = next(iter(urls.items()))
+        last_error = ""
+        while time.monotonic() < deadline:
+            try:
+                self._verify_url(first_url, min(5, max(1, deadline - time.monotonic())))
+                break
+            except (HTTPError, URLError, OSError, TimeoutError) as error:
+                last_error = type(error).__name__
+                time.sleep(1)
+        else:
+            raise RuntimeError(
+                f"临时公网通道未就绪，参考素材 {first_id} 无法访问"
+                + (f"（{last_error}）" if last_error else "")
+            )
+
+        for logical_id, url in list(urls.items())[1:]:
+            try:
+                self._verify_url(url, min(10, max(1, deadline - time.monotonic())))
+            except (HTTPError, URLError, OSError, TimeoutError) as error:
+                raise RuntimeError(
+                    f"临时公网通道中的参考素材 {logical_id} 无法访问"
+                    f"（{type(error).__name__}）"
+                ) from error
+
+    @staticmethod
+    def _verify_url(url: str, timeout_seconds: float) -> None:
+        request = Request(
+            url,
+            headers={"User-Agent": "MingyanAssetGateway/1.0"},
+            method="HEAD",
+        )
+        with urlopen(request, timeout=timeout_seconds) as response:
+            if response.status != 200:
+                raise HTTPError(
+                    url,
+                    response.status,
+                    "临时素材地址返回异常",
+                    response.headers,
+                    None,
+                )
+            if response.headers.get_content_type() not in CONTENT_TYPES.values():
+                raise ValueError("临时素材地址未返回图片")
 
     def _wait_for_public_url(self, output_queue: Queue[str]) -> str:
         public_url = ""
