@@ -1,0 +1,4 @@
+interface:
+  display_name: "明琰15秒视频提示词"
+  short_description: "生成BD Seedance2.5可直接使用的15秒七维连续视频提示词"
+  default_prompt: "使用 $mingyan-seedance-15s-prompt 把这段剧本和参考图整理成一条15秒视频提示词。"

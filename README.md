@@ -40,6 +40,7 @@
 - 临时素材公网通道：使用 Cloudflare Quick Tunnel 为当前视频清单建立独立白名单图片服务；随机会话令牌与随机文件名双重保护，不暴露主应用，关闭或退出本地服务后地址失效
 - 可恢复的视频生成队列：相邻分镜组自动合并，每次固定提交 30 秒以适配按条计费；提交前持久化任务，自动开启素材通道并保存服务商任务号，完成后下载 MP4 到本机，中断恢复时复用已有任务号避免重复扣费
 - 内置 `mingyan-seedance-30s-prompt` Skill：把剧本、连续分镜和有序资产参考图编译成 BD Seedance2.5 可直接使用的 30 秒时间轴提示词
+- 内置 `mingyan-seedance-15s-prompt` Skill：把单个镜头组和有序资产参考图编译成 15 秒七维连续视频提示词
 - macOS 与 Windows 启动脚本
 - Docker Compose 运行方式
 - GitHub Actions 的 macOS / Windows 构建与测试配置
