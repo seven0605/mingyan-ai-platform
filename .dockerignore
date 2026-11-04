@@ -1,0 +1,7 @@
+.git
+.venv
+design
+dist
+node_modules
+work
+*.tsbuildinfo

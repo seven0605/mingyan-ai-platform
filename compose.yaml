@@ -1,0 +1,11 @@
+services:
+  mingyan-ai:
+    build: .
+    ports:
+      - "127.0.0.1:4173:4173"
+    volumes:
+      - mingyan-data:/data
+    restart: unless-stopped
+
+volumes:
+  mingyan-data:

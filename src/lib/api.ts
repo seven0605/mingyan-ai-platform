@@ -1,0 +1,248 @@
+import type {
+  AssetLibrary,
+  ImageModelSettings,
+  Project,
+  ProjectStage,
+  ProjectTask,
+  Screenplay,
+  ScreenplayMode,
+  Storyboard,
+  StoryboardAspectRatio,
+  StoryboardTargetModel,
+  ScriptPlan,
+  SourceDocument,
+  StoryAnalysis,
+  TextModelConnection,
+  TextModelSettings,
+} from "../types";
+
+interface NewProjectInput {
+  name: string;
+  description: string;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...init?.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(payload?.detail ?? `本地服务请求失败（${response.status}）`);
+  }
+
+  return response.json() as Promise<T>;
+}
+
+export function listProjects() {
+  return request<Project[]>("/api/projects");
+}
+
+export function createProject(input: NewProjectInput) {
+  return request<Project>("/api/projects", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateProjectStage(projectId: string, stage: ProjectStage) {
+  return request<Project>(`/api/projects/${projectId}/stage`, {
+    method: "PATCH",
+    body: JSON.stringify({ stage }),
+  });
+}
+
+export function getProjectSource(projectId: string) {
+  return request<SourceDocument | null>(`/api/projects/${projectId}/source`);
+}
+
+export function saveProjectSource(projectId: string, title: string, content: string) {
+  return request<SourceDocument>(`/api/projects/${projectId}/source`, {
+    method: "PUT",
+    body: JSON.stringify({ title, content }),
+  });
+}
+
+export function getProjectAnalysis(projectId: string) {
+  return request<StoryAnalysis | null>(`/api/projects/${projectId}/analysis`);
+}
+
+export function analyzeProject(projectId: string) {
+  return request<StoryAnalysis>(`/api/projects/${projectId}/analysis`, {
+    method: "POST",
+  });
+}
+
+export function getTextModelSettings() {
+  return request<TextModelSettings>("/api/settings/text-model");
+}
+
+export function saveTextModelSettings(input: {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+}) {
+  return request<TextModelSettings>("/api/settings/text-model", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function testTextModelConnection() {
+  return request<TextModelConnection>("/api/settings/text-model/test", {
+    method: "POST",
+  });
+}
+
+export function getImageModelSettings() {
+  return request<ImageModelSettings>("/api/settings/image-model");
+}
+
+export function saveImageModelSettings(input: {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+}) {
+  return request<ImageModelSettings>("/api/settings/image-model", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function testImageModelConnection() {
+  return request<TextModelConnection>("/api/settings/image-model/test", {
+    method: "POST",
+  });
+}
+
+export function getScriptPlan(projectId: string) {
+  return request<ScriptPlan | null>(`/api/projects/${projectId}/script-plan`);
+}
+
+export function generateScriptPlan(projectId: string) {
+  return request<ScriptPlan>(`/api/projects/${projectId}/script-plan`, {
+    method: "POST",
+  });
+}
+
+export function getScreenplay(projectId: string) {
+  return request<Screenplay | null>(`/api/projects/${projectId}/screenplay`);
+}
+
+export function generateScreenplay(
+  projectId: string,
+  input: {
+    adaptationMode: ScreenplayMode;
+    targetSeconds: 60 | 90 | 120 | 180;
+    episodeCount: number;
+  },
+) {
+  return request<Screenplay>(`/api/projects/${projectId}/screenplay`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function saveScreenplay(projectId: string, screenplay: Screenplay) {
+  const {
+    adaptationMode,
+    targetSeconds,
+    episodeCount,
+    episodes,
+    continuityNotes,
+  } = screenplay;
+  return request<Screenplay>(`/api/projects/${projectId}/screenplay`, {
+    method: "PUT",
+    body: JSON.stringify({
+      adaptationMode,
+      targetSeconds,
+      episodeCount,
+      episodes,
+      continuityNotes,
+    }),
+  });
+}
+
+export function approveScreenplay(projectId: string) {
+  return request<Screenplay>(`/api/projects/${projectId}/screenplay/approve`, {
+    method: "POST",
+  });
+}
+
+export function refineScreenplayEpisode(projectId: string, episodeNumber: number) {
+  return request<Screenplay>(
+    `/api/projects/${projectId}/screenplay/episodes/${episodeNumber}/refine`,
+    { method: "POST" },
+  );
+}
+
+export function getStoryboards(projectId: string) {
+  return request<Storyboard[]>(`/api/projects/${projectId}/storyboards`);
+}
+
+export function generateStoryboard(
+  projectId: string,
+  episodeNumber: number,
+  input: { targetModel: StoryboardTargetModel; aspectRatio: StoryboardAspectRatio },
+) {
+  return request<Storyboard>(`/api/projects/${projectId}/storyboards/${episodeNumber}`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function saveStoryboard(projectId: string, episodeNumber: number, storyboard: Storyboard) {
+  const { episodeTitle, styleBible, groups, continuityNotes } = storyboard;
+  return request<Storyboard>(`/api/projects/${projectId}/storyboards/${episodeNumber}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      episodeNumber,
+      episodeTitle,
+      styleBible,
+      groups,
+      continuityNotes,
+    }),
+  });
+}
+
+export function getAssetLibrary(projectId: string) {
+  return request<AssetLibrary | null>(`/api/projects/${projectId}/assets`);
+}
+
+export function getProjectTasks(projectId: string) {
+  return request<ProjectTask[]>(`/api/projects/${projectId}/tasks`);
+}
+
+export function extractAssetLibrary(projectId: string) {
+  return request<AssetLibrary>(`/api/projects/${projectId}/assets/extract`, {
+    method: "POST",
+  });
+}
+
+export function saveAssetLibrary(projectId: string, library: AssetLibrary) {
+  return request<AssetLibrary>(`/api/projects/${projectId}/assets`, {
+    method: "PUT",
+    body: JSON.stringify({ items: library.items, standard: library.standard }),
+  });
+}
+
+export function generateAssetReferenceImage(projectId: string, assetId: string) {
+  return request<AssetLibrary>(`/api/projects/${projectId}/assets/${assetId}/images`, {
+    method: "POST",
+  });
+}
+
+export function setPrimaryAssetReferenceImage(
+  projectId: string,
+  assetId: string,
+  imageId: string,
+) {
+  return request<AssetLibrary>(
+    `/api/projects/${projectId}/assets/${assetId}/images/${imageId}/primary`,
+    { method: "PUT" },
+  );
+}
