@@ -939,7 +939,7 @@ def build_video_plan_items(
                     aspectRatio=storyboard.aspectRatio,
                     targetModel=storyboard.targetModel,
                     purpose=group.purpose,
-                    prompt=group.videoPrompt,
+                    prompt=compile_storyboard_group_prompt(group),
                     assetReferences=references,
                     blockingReasons=blocking_reasons,
                     ready=not blocking_reasons,
@@ -1018,6 +1018,42 @@ def unique_strings(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
+def compile_storyboard_group_prompt(group: StoryboardGroup) -> str:
+    beats = []
+    for index, segment in enumerate(group.segments, start=1):
+        beats.append(
+            "\n".join(
+                [
+                    f"镜头节拍 {index}",
+                    f"镜头：{segment.camera}",
+                    f"动作：{segment.action}",
+                    f"运动视觉：{segment.motionVisual}",
+                    f"表演：{segment.expression}",
+                    f"环境：{segment.environment}",
+                    f"特效：{segment.effects}",
+                    f"声音：{segment.sound}",
+                ]
+            )
+        )
+    subjects = "、".join(group.subjects)
+    beat_text = "\n\n".join(beats)
+    return "\n\n".join(
+        [
+            f"【首帧锁定】{group.firstFrameLock}",
+            f"【场景与空间】{group.sceneDescription}；{group.spatialRelations}",
+            f"【人物与物品视觉锚点】{subjects}",
+            f"【动作与表演节拍】\n{beat_text}",
+            f"【情绪转折】{group.emotionalTurn}",
+            f"【动作时间逻辑】{group.actionTimeline}",
+            f"【摄影语言】{group.cameraLanguage}",
+            f"【关键对白】{group.keyDialogue or '无'}",
+            f"【画面标准】{group.qualityBase}；{group.visualStyle}；{group.generationParams}",
+            f"【模型执行主提示词】{group.videoPrompt}",
+            f"【禁止项】{group.negativePrompt}",
+        ]
+    )
+
+
 def pack_video_plan_items(
     items: list[VideoProductionPlanItem],
 ) -> list[list[VideoProductionPlanItem]]:
@@ -1045,7 +1081,8 @@ def pack_video_plan_items(
 def build_video_batch_prompt(items: list[VideoProductionPlanItem]) -> str:
     cursor = 0
     sections = [
-        "生成一条完整30秒连续视频。严格按以下时间轴执行；各段人物身份、服装、场景、站位与动作必须连续，不得重复前段剧情。"
+        "【任务参数】BD Seedance2.5，30秒，写实电影质感。",
+        "【全局连续性硬锁】严格按以下时间轴执行；各段人物身份、五官、年龄、体态、服装、发型、伤势、道具、场景结构、主光方向、站位与运动方向连续，不得重复前段剧情，不得越轴。动作遵守重力、惯性、接触与受力反馈。",
     ]
     for item in items:
         end = cursor + item.durationSeconds
@@ -1059,6 +1096,9 @@ def build_video_batch_prompt(items: list[VideoProductionPlanItem]) -> str:
             f"【{cursor:02d}-{VIDEO_REQUEST_SECONDS:02d}秒｜自然收束】\n"
             "延续最后一个镜头的动作和情绪，让表演、环境声与镜头运动自然收束；不新增人物、事件或台词。"
         )
+    sections.append(
+        "【终帧连续性】30秒终帧保持最后一段人物位置、朝向、姿态、表情、服装、伤势、手中物、场景结构和光线，形成可供下一条视频直接顺接的稳定构图。"
+    )
     return "\n\n".join(sections)
 
 

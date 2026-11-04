@@ -375,6 +375,9 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             assert request_payload["seconds"] == "30"
             assert "【00-15秒｜第1集·镜头组1】" in request_payload["prompt"]
             assert "【15-30秒｜第1集·镜头组2】" in request_payload["prompt"]
+            assert "【全局连续性硬锁】" in request_payload["prompt"]
+            assert "【首帧锁定】" in request_payload["prompt"]
+            assert "镜头节拍 1" in request_payload["prompt"]
             assert request_payload["size"] == "1280x720"
             reference_urls = request_payload["metadata"]["__workbench_refs"][
                 "reference_image_urls"
