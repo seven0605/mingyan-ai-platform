@@ -642,6 +642,9 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             item["name"] for item in asset_library["items"] if item["kind"] == "prop"
         }
         assert client.get(f"/api/projects/{project['id']}/tasks").json() == []
+        assert client.get(
+            f"/api/projects/{project['id']}/assets/batch-plan"
+        ).json() is None
 
         editable_assets = {
             "items": asset_library["items"],
@@ -684,6 +687,14 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         yun_zishu_id = next(
             item for item in saved_assets.json()["items"] if item["name"] == "云子姝"
         )["id"]
+        xiao_yunheng_id = next(
+            item for item in saved_assets.json()["items"] if item["name"] == "萧云衡"
+        )["id"]
+        unconfirmed_batch = client.post(
+            f"/api/projects/{project['id']}/assets/batch-plan",
+            json={"assetIds": [xiao_yunheng_id]},
+        )
+        assert unconfirmed_batch.status_code == 409
         generated_assets = client.post(
             f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images"
         )
@@ -722,6 +733,19 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert local_image.headers["content-type"] == "image/png"
         assert local_image.content.startswith(b"\x89PNG")
 
+        batch_plan = client.post(
+            f"/api/projects/{project['id']}/assets/batch-plan",
+            json={"assetIds": [yun_zishu_id]},
+        )
+        assert batch_plan.status_code == 200
+        assert batch_plan.json()["current"] is True
+        assert batch_plan.json()["costSampleCount"] == 1
+        assert batch_plan.json()["estimatedUnitCost"] == 0.23
+        assert batch_plan.json()["estimatedTotalCost"] == 0.23
+        assert batch_plan.json()["items"][0]["name"] == "云子姝"
+        assert batch_plan.json()["items"][0]["existingVersionCount"] == 1
+        assert batch_plan.json()["items"][0]["prompt"] == original_prompt
+
         image_generation_failed = True
         failed_image_generation = client.post(
             f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images"
@@ -748,6 +772,9 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         )
         assert len(second_yun_zishu["referenceImages"]) == 2
         assert second_yun_zishu["primaryReferenceImageId"] == generated_image["id"]
+        assert client.get(
+            f"/api/projects/{project['id']}/assets/batch-plan"
+        ).json()["current"] is False
         second_image = second_yun_zishu["referenceImages"][1]
         assert len(client.get(f"/api/projects/{project['id']}/tasks").json()) == 2
         missing_primary = client.put(
@@ -764,6 +791,14 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             if item["name"] == "云子姝"
         )
         assert selected_yun_zishu["primaryReferenceImageId"] == second_image["id"]
+        refreshed_batch_plan = client.post(
+            f"/api/projects/{project['id']}/assets/batch-plan",
+            json={"assetIds": [yun_zishu_id]},
+        )
+        assert refreshed_batch_plan.status_code == 200
+        assert refreshed_batch_plan.json()["current"] is True
+        assert refreshed_batch_plan.json()["costSampleCount"] == 2
+        assert refreshed_batch_plan.json()["items"][0]["existingVersionCount"] == 2
 
         invalid_assets = json.loads(json.dumps(editable_assets, ensure_ascii=False))
         invalid_yun_zishu = next(
@@ -827,6 +862,11 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         restored_tasks = client.get(f"/api/projects/{projects[0]['id']}/tasks").json()
         assert len(restored_tasks) == 2
         assert all(task["status"] == "completed" for task in restored_tasks)
+        restored_batch_plan = client.get(
+            f"/api/projects/{projects[0]['id']}/assets/batch-plan"
+        ).json()
+        assert restored_batch_plan["current"] is True
+        assert restored_batch_plan["items"][0]["name"] == "云子姝"
         settings = client.get("/api/settings/text-model").json()
         assert settings["configured"] is True
         assert settings["model"] == "example-chat"

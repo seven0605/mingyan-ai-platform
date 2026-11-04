@@ -1,4 +1,5 @@
 import type {
+  AssetBatchPlan,
   AssetLibrary,
   ImageModelSettings,
   Project,
@@ -211,6 +212,17 @@ export function saveStoryboard(projectId: string, episodeNumber: number, storybo
 
 export function getAssetLibrary(projectId: string) {
   return request<AssetLibrary | null>(`/api/projects/${projectId}/assets`);
+}
+
+export function getAssetBatchPlan(projectId: string) {
+  return request<AssetBatchPlan | null>(`/api/projects/${projectId}/assets/batch-plan`);
+}
+
+export function confirmAssetBatchPlan(projectId: string, assetIds: string[]) {
+  return request<AssetBatchPlan>(`/api/projects/${projectId}/assets/batch-plan`, {
+    method: "POST",
+    body: JSON.stringify({ assetIds }),
+  });
 }
 
 export function getProjectTasks(projectId: string) {

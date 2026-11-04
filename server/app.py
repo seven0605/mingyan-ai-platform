@@ -403,6 +403,41 @@ class AssetLibraryOut(AssetLibraryPayload):
     updatedAt: str
 
 
+class AssetBatchPlanCreate(BaseModel):
+    assetIds: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("assetIds")
+    @classmethod
+    def validate_asset_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("批量生产清单不能包含重复资产")
+        return values
+
+
+class AssetBatchPlanItem(BaseModel):
+    assetId: str
+    assetKind: Literal["character", "scene", "prop"]
+    name: str
+    prompt: str
+    aspectRatio: str
+    existingVersionCount: int
+
+
+class AssetBatchPlanPayload(BaseModel):
+    items: list[AssetBatchPlanItem]
+    estimatedUnitCost: float | None = None
+    estimatedTotalCost: float | None = None
+    costSampleCount: int = 0
+    assetLibraryUpdatedAt: str
+    confirmedAt: str
+
+
+class AssetBatchPlanOut(AssetBatchPlanPayload):
+    projectId: str
+    current: bool
+    updatedAt: str
+
+
 class ProjectTaskOut(BaseModel):
     id: str
     projectId: str
@@ -535,6 +570,16 @@ def initialize_database(database_path: Path) -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS asset_batch_plans (
+                project_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """
+        )
         screenplay_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(project_screenplays)").fetchall()
@@ -629,6 +674,18 @@ def row_to_asset_library(row: sqlite3.Row) -> AssetLibraryOut:
         projectId=row["project_id"],
         screenplayUpdatedAt=row["screenplay_updated_at"],
         storyboardUpdatedAt=row["storyboard_updated_at"],
+        updatedAt=row["updated_at"],
+        **payload.model_dump(),
+    )
+
+
+def row_to_asset_batch_plan(
+    row: sqlite3.Row, asset_library_updated_at: str
+) -> AssetBatchPlanOut:
+    payload = AssetBatchPlanPayload.model_validate(json.loads(row["payload"]))
+    return AssetBatchPlanOut(
+        projectId=row["project_id"],
+        current=payload.assetLibraryUpdatedAt == asset_library_updated_at,
         updatedAt=row["updated_at"],
         **payload.model_dump(),
     )
@@ -2356,6 +2413,121 @@ def create_app(
                 "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
             ).fetchone()
         return row_to_asset_library(row) if row else None
+
+    @application.get(
+        "/api/projects/{project_id}/assets/batch-plan",
+        response_model=AssetBatchPlanOut | None,
+    )
+    def get_asset_batch_plan(project_id: str) -> AssetBatchPlanOut | None:
+        with connect(database_path) as connection:
+            project = connection.execute(
+                "SELECT id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise HTTPException(status_code=404, detail="项目不存在")
+            asset_row = connection.execute(
+                "SELECT updated_at FROM project_assets WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            plan_row = connection.execute(
+                "SELECT * FROM asset_batch_plans WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if plan_row is None:
+            return None
+        if asset_row is None:
+            raise HTTPException(status_code=409, detail="资产库不存在，不能读取生产清单")
+        return row_to_asset_batch_plan(plan_row, asset_row["updated_at"])
+
+    @application.post(
+        "/api/projects/{project_id}/assets/batch-plan",
+        response_model=AssetBatchPlanOut,
+    )
+    def confirm_asset_batch_plan(
+        project_id: str, request: AssetBatchPlanCreate
+    ) -> AssetBatchPlanOut:
+        with connect(database_path) as connection:
+            screenplay_row = connection.execute(
+                "SELECT status, updated_at FROM project_screenplays WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            asset_row = connection.execute(
+                "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        if screenplay_row is None or screenplay_row["status"] != "approved":
+            raise HTTPException(status_code=409, detail="剧本未确认，不能确认批量生产清单")
+        if asset_row is None:
+            raise HTTPException(status_code=404, detail="请先从剧本整理资产")
+        if asset_row["screenplay_updated_at"] != screenplay_row["updated_at"]:
+            raise HTTPException(status_code=409, detail="剧本已更新，请重新整理资产")
+
+        library = AssetLibraryPayload.model_validate(json.loads(asset_row["payload"]))
+        assets_by_id = {item.id: item for item in library.items}
+        selected: list[AssetItem] = []
+        for asset_id in request.assetIds:
+            try:
+                UUID(asset_id)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail="生产清单包含无效资产编号") from error
+            asset = assets_by_id.get(asset_id)
+            if asset is None:
+                raise HTTPException(status_code=404, detail="生产清单包含不存在的资产")
+            if asset.status != "confirmed":
+                raise HTTPException(status_code=409, detail=f"{asset.name} 尚未确认，不能加入生产清单")
+            if not asset.referencePrompt.strip():
+                raise HTTPException(status_code=422, detail=f"{asset.name} 的生图提示词为空")
+            selected.append(asset)
+
+        cost_samples = [
+            image.cost
+            for item in library.items
+            for image in item.referenceImages
+            if image.cost is not None
+        ]
+        estimated_unit_cost = (
+            round(sum(cost_samples) / len(cost_samples), 4) if cost_samples else None
+        )
+        estimated_total_cost = (
+            round(estimated_unit_cost * len(selected), 4)
+            if estimated_unit_cost is not None
+            else None
+        )
+        aspect_ratios = {"character": "3:4", "scene": "16:9", "prop": "1:1"}
+        now = utc_now()
+        payload = AssetBatchPlanPayload(
+            items=[
+                AssetBatchPlanItem(
+                    assetId=item.id,
+                    assetKind=item.kind,
+                    name=item.name,
+                    prompt=item.referencePrompt,
+                    aspectRatio=aspect_ratios[item.kind],
+                    existingVersionCount=len(item.referenceImages),
+                )
+                for item in selected
+            ],
+            estimatedUnitCost=estimated_unit_cost,
+            estimatedTotalCost=estimated_total_cost,
+            costSampleCount=len(cost_samples),
+            assetLibraryUpdatedAt=asset_row["updated_at"],
+            confirmedAt=now,
+        )
+        with connect(database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO asset_batch_plans (project_id, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, payload.model_dump_json(), now),
+            )
+            saved = connection.execute(
+                "SELECT * FROM asset_batch_plans WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return row_to_asset_batch_plan(saved, asset_row["updated_at"])
 
     @application.get(
         "/api/projects/{project_id}/tasks", response_model=list[ProjectTaskOut]

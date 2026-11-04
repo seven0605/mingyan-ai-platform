@@ -2,25 +2,30 @@ import {
   ArrowLeft,
   Boxes,
   BookOpenText,
+  Calculator,
   Check,
   CheckCircle2,
   Crown,
   Cuboid,
   Image as ImageIcon,
   ImageOff,
+  ListChecks,
   LoaderCircle,
   Map,
   Palette,
   RefreshCw,
   Save,
+  ShieldCheck,
   Sparkles,
   UserRound,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import {
+  confirmAssetBatchPlan,
   extractAssetLibrary,
   generateAssetReferenceImage,
+  getAssetBatchPlan,
   getAssetLibrary,
   getScreenplay,
   getStoryboards,
@@ -37,6 +42,7 @@ import {
   type CompiledAssetPrompt,
 } from "../lib/assetPromptCompiler";
 import type {
+  AssetBatchPlan,
   AssetItem,
   AssetKind,
   AssetLibrary,
@@ -85,6 +91,10 @@ function editableLibrarySignature(library: AssetLibrary | null) {
   } : null);
 }
 
+function formatCost(value: number) {
+  return value.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
+}
+
 export function AssetWorkspace({
   project,
   onBack,
@@ -110,6 +120,13 @@ export function AssetWorkspace({
     assetId: string;
     compiled: CompiledAssetPrompt;
   } | null>(null);
+  const [batchPlan, setBatchPlan] = useState<AssetBatchPlan | null>(null);
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchSelectedIds, setBatchSelectedIds] = useState<string[]>([]);
+  const [batchReviewId, setBatchReviewId] = useState<string | null>(null);
+  const [batchReviewedIds, setBatchReviewedIds] = useState<string[]>([]);
+  const [batchAcknowledged, setBatchAcknowledged] = useState(false);
+  const [batchSaving, setBatchSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -118,6 +135,7 @@ export function AssetWorkspace({
       setScreenplay(null);
       setStoryboards([]);
       setLibrary(null);
+      setBatchPlan(null);
       return;
     }
     let active = true;
@@ -127,14 +145,16 @@ export function AssetWorkspace({
       getScreenplay(project.id),
       getStoryboards(project.id),
       getAssetLibrary(project.id),
+      getAssetBatchPlan(project.id),
     ])
-      .then(([screenplayResult, storyboardResult, libraryResult]) => {
+      .then(([screenplayResult, storyboardResult, libraryResult, batchPlanResult]) => {
         if (!active) return;
         setScreenplay(screenplayResult);
         setStoryboards(storyboardResult);
         setLibrary(libraryResult);
         setSavedSignature(editableLibrarySignature(libraryResult));
         setSelectedId(libraryResult?.items[0]?.id ?? null);
+        setBatchPlan(batchPlanResult);
       })
       .catch((loadError: unknown) => {
         if (active) {
@@ -177,6 +197,35 @@ export function AssetWorkspace({
   ) ?? COSTUME_ERA_OPTIONS[0];
   const confirmedCount = library?.items.filter((item) => item.status === "confirmed").length ?? 0;
   const generatedCount = library?.items.filter((item) => item.referenceImages.length > 0).length ?? 0;
+  const eligibleBatchItems = useMemo(
+    () => library?.items.filter((item) => item.status === "confirmed" && itemReady(item)) ?? [],
+    [library],
+  );
+  const selectedBatchItems = useMemo(() => {
+    const selected = new Set(batchSelectedIds);
+    return library?.items.filter((item) => selected.has(item.id)) ?? [];
+  }, [batchSelectedIds, library]);
+  const batchReviewItem = library?.items.find((item) => item.id === batchReviewId) ?? selectedBatchItems[0] ?? null;
+  const batchCostSamples = useMemo(
+    () => library?.items.flatMap((item) => item.referenceImages)
+      .map((image) => image.cost)
+      .filter((cost): cost is number => cost !== null) ?? [],
+    [library],
+  );
+  const estimatedUnitCost = batchCostSamples.length
+    ? batchCostSamples.reduce((total, cost) => total + cost, 0) / batchCostSamples.length
+    : null;
+  const estimatedTotalCost = estimatedUnitCost === null
+    ? null
+    : estimatedUnitCost * selectedBatchItems.length;
+  const reviewedSet = useMemo(() => new Set(batchReviewedIds), [batchReviewedIds]);
+  const allSelectedReviewed = selectedBatchItems.length > 0
+    && selectedBatchItems.every((item) => reviewedSet.has(item.id));
+  const batchSelectionMatchesPlan = Boolean(
+    batchPlan?.current
+    && batchPlan.items.length === selectedBatchItems.length
+    && batchPlan.items.every((item) => batchSelectedIds.includes(item.assetId)),
+  );
   const libraryCurrent = Boolean(
     library
     && screenplay
@@ -195,6 +244,7 @@ export function AssetWorkspace({
       const firstCharacter = result.items.find((item) => item.kind === "character");
       setKind(firstCharacter?.kind ?? result.items[0]?.kind ?? "character");
       setSelectedId(firstCharacter?.id ?? result.items[0]?.id ?? null);
+      setBatchPlan((current) => current ? { ...current, current: false } : current);
       await onAssetsReady();
     } catch (extractError) {
       setError(extractError instanceof Error ? extractError.message : "资产整理失败");
@@ -270,6 +320,7 @@ export function AssetWorkspace({
       const result = await saveAssetLibrary(project.id, library);
       setLibrary(result);
       setSavedSignature(editableLibrarySignature(result));
+      setBatchPlan((current) => current ? { ...current, current: false } : current);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "资产保存失败");
     } finally {
@@ -297,6 +348,7 @@ export function AssetWorkspace({
       const result = await generateAssetReferenceImage(project.id, selectedItem.id);
       setLibrary(result);
       setSavedSignature(editableLibrarySignature(result));
+      setBatchPlan((current) => current ? { ...current, current: false } : current);
       const updatedItem = result.items.find((item) => item.id === selectedItem.id);
       setPreviewImageId(updatedItem?.referenceImages[updatedItem.referenceImages.length - 1]?.id ?? null);
     } catch (generationError) {
@@ -322,10 +374,61 @@ export function AssetWorkspace({
       );
       setLibrary(result);
       setSavedSignature(editableLibrarySignature(result));
+      setBatchPlan((current) => current ? { ...current, current: false } : current);
     } catch (primaryError) {
       setError(primaryError instanceof Error ? primaryError.message : "主参考图设置失败");
     } finally {
       setSettingPrimary(false);
+    }
+  };
+
+  const openBatchPlan = () => {
+    if (dirty) {
+      setError("请先保存当前资产修改，再建立批量生产清单");
+      return;
+    }
+    const savedIds = batchPlan?.current
+      ? batchPlan.items.map((item) => item.assetId).filter((id) => eligibleBatchItems.some((item) => item.id === id))
+      : [];
+    const defaultIds = eligibleBatchItems
+      .filter((item) => item.referenceImages.length === 0)
+      .map((item) => item.id);
+    const nextIds = savedIds.length ? savedIds : (defaultIds.length ? defaultIds : eligibleBatchItems.map((item) => item.id));
+    setBatchSelectedIds(nextIds);
+    setBatchReviewedIds(savedIds);
+    setBatchReviewId(nextIds[0] ?? eligibleBatchItems[0]?.id ?? library?.items[0]?.id ?? null);
+    setBatchAcknowledged(false);
+    setBatchOpen(true);
+    setError(null);
+  };
+
+  const toggleBatchSelection = (assetId: string) => {
+    setBatchSelectedIds((current) => current.includes(assetId)
+      ? current.filter((id) => id !== assetId)
+      : [...current, assetId]);
+    setBatchAcknowledged(false);
+  };
+
+  const selectBatchItems = (items: AssetItem[]) => {
+    setBatchSelectedIds(items.map((item) => item.id));
+    setBatchReviewId(items[0]?.id ?? null);
+    setBatchAcknowledged(false);
+  };
+
+  const handleConfirmBatchPlan = async () => {
+    if (!project || !selectedBatchItems.length || !allSelectedReviewed || !batchAcknowledged) return;
+    setBatchSaving(true);
+    setError(null);
+    try {
+      const result = await confirmAssetBatchPlan(project.id, selectedBatchItems.map((item) => item.id));
+      setBatchPlan(result);
+      setBatchSelectedIds(result.items.map((item) => item.assetId));
+      setBatchReviewedIds(result.items.map((item) => item.assetId));
+      setBatchAcknowledged(false);
+    } catch (batchError) {
+      setError(batchError instanceof Error ? batchError.message : "批量生产清单保存失败");
+    } finally {
+      setBatchSaving(false);
     }
   };
 
@@ -406,6 +509,16 @@ export function AssetWorkspace({
                 {extracting ? <LoaderCircle className="spinning" size={15} /> : <RefreshCw size={15} />}
                 重新整理
               </button>
+              <button
+                className="button secondary compact"
+                type="button"
+                disabled={dirty || !eligibleBatchItems.length}
+                onClick={openBatchPlan}
+                title={dirty ? "请先保存资产修改" : "只保存生产清单，不会立即生成图片"}
+              >
+                <ListChecks size={15} />
+                {batchPlan?.current ? `生产清单 ${batchPlan.items.length}` : "批量生产预检"}
+              </button>
               <button className="button primary compact" type="button" disabled={!dirty || saving} onClick={handleSave}>
                 {saving ? <LoaderCircle className="spinning" size={15} /> : <Save size={15} />}
                 {saving ? "保存中" : "保存资产"}
@@ -479,7 +592,15 @@ export function AssetWorkspace({
             <div><span>已确认</span><strong>{confirmedCount}</strong></div>
             <div><span>待完善</span><strong>{library.items.length - confirmedCount}</strong></div>
             <div><span>已有参考图</span><strong>{generatedCount}</strong></div>
-            <p>{imageModelConfigured ? "图像模型已连接；确认文字规范后可逐个生成并保留历史版本。" : "图像模型尚未配置，请先前往 API 设置。"}</p>
+            <p>
+              {batchPlan?.current
+                ? `已确认 ${batchPlan.items.length} 项生产清单；当前阶段尚未排队或消耗额度。`
+                : batchPlan
+                  ? "已有生产清单因资产发生变化而过期，请重新审查确认。"
+                  : imageModelConfigured
+                    ? "图像模型已连接；可先建立批量生产清单，审查不会消耗额度。"
+                    : "图像模型尚未配置，请先前往 API 设置。"}
+            </p>
           </section>
 
           {error ? <div className="form-error asset-error">{error}</div> : null}
@@ -728,6 +849,163 @@ export function AssetWorkspace({
               <div className="asset-no-selection"><Boxes size={28} />当前分类没有资产</div>
             )}
           </section>
+          {batchOpen ? (
+            <div
+              className="asset-batch-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="asset-batch-title"
+              onClick={() => setBatchOpen(false)}
+            >
+              <div className="asset-batch-panel" onClick={(event) => event.stopPropagation()}>
+                <header>
+                  <div>
+                    <strong id="asset-batch-title">批量资产生产预检</strong>
+                    <span>选择资产、逐项审查提示词并保存生产清单；本步骤不会生成图片。</span>
+                  </div>
+                  <button type="button" aria-label="关闭批量生产预检" onClick={() => setBatchOpen(false)} autoFocus>
+                    <X size={20} />
+                  </button>
+                </header>
+
+                <section className="asset-batch-summary" aria-label="批量生产估算">
+                  <div><ListChecks size={17} /><span>已选择</span><strong>{selectedBatchItems.length} 项</strong></div>
+                  <div><Sparkles size={17} /><span>预计消耗</span><strong>{selectedBatchItems.length} 次</strong></div>
+                  <div>
+                    <Calculator size={17} />
+                    <span>预计费用记录</span>
+                    <strong>{estimatedTotalCost === null ? "暂无估算" : formatCost(estimatedTotalCost)}</strong>
+                  </div>
+                  <p>
+                    {estimatedUnitCost === null
+                      ? "项目尚无可用费用样本；清单仍可保存，实际费用以服务商任务结果为准。"
+                      : `基于 ${batchCostSamples.length} 条本机历史记录，平均每张 ${formatCost(estimatedUnitCost)}；实际费用以服务商返回为准。`}
+                  </p>
+                </section>
+
+                {batchSelectionMatchesPlan ? (
+                  <div className="asset-batch-saved">
+                    <ShieldCheck size={16} />
+                    当前 {batchPlan?.items.length} 项清单已确认并保存；尚未进入生成队列，也未消耗额度。
+                  </div>
+                ) : null}
+
+                <div className="asset-batch-body">
+                  <section className="asset-batch-list" aria-label="资产生产选择">
+                    <header>
+                      <div>
+                        <strong>资产选择</strong>
+                        <span>{eligibleBatchItems.length} 项已确认可加入清单</span>
+                      </div>
+                      <div>
+                        <button type="button" onClick={() => selectBatchItems(eligibleBatchItems.filter((item) => !item.referenceImages.length))}>仅选未生成</button>
+                        <button type="button" onClick={() => selectBatchItems(eligibleBatchItems)}>选择全部</button>
+                      </div>
+                    </header>
+                    <div className="asset-batch-rows">
+                      {library.items.map((item) => {
+                        const eligible = item.status === "confirmed" && itemReady(item);
+                        const selected = batchSelectedIds.includes(item.id);
+                        const reviewed = reviewedSet.has(item.id);
+                        return (
+                          <div
+                            className={`asset-batch-row${batchReviewItem?.id === item.id ? " active" : ""}${eligible ? "" : " disabled"}`}
+                            key={item.id}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              disabled={!eligible}
+                              aria-label={`${selected ? "从生产清单移除" : "加入生产清单"}${item.name}`}
+                              onChange={() => toggleBatchSelection(item.id)}
+                            />
+                            <button type="button" onClick={() => setBatchReviewId(item.id)}>
+                              <span><strong>{item.name}</strong><small>{KIND_META[item.kind].label} · {item.referenceImages.length} 个现有版本</small></span>
+                              <em>
+                                {!eligible ? "待确认" : selected ? (reviewed ? "已审查" : "待审查") : "未选择"}
+                              </em>
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+
+                  <section className="asset-batch-review" aria-label="提示词审查">
+                    {batchReviewItem ? (
+                      <>
+                        <header>
+                          <div>
+                            <strong>{batchReviewItem.name}</strong>
+                            <span>{KIND_META[batchReviewItem.kind].label}资产 · {batchReviewItem.kind === "character" ? "3:4" : batchReviewItem.kind === "scene" ? "16:9" : "1:1"} · 1K</span>
+                          </div>
+                          <span className={reviewedSet.has(batchReviewItem.id) ? "reviewed" : ""}>
+                            {reviewedSet.has(batchReviewItem.id) ? "已完成审查" : "等待审查"}
+                          </span>
+                        </header>
+                        <div className="asset-batch-prompt">
+                          <span>将要保存的生图提示词快照</span>
+                          <pre>{batchReviewItem.referencePrompt || "当前没有提示词"}</pre>
+                        </div>
+                        <footer>
+                          <p>请确认人物身份、服饰、材质、空间关系与禁止项准确；保存清单后仍不会自动生图。</p>
+                          <button
+                            className="button secondary compact"
+                            type="button"
+                            disabled={!batchSelectedIds.includes(batchReviewItem.id)}
+                            onClick={() => setBatchReviewedIds((current) => current.includes(batchReviewItem.id) ? current : [...current, batchReviewItem.id])}
+                          >
+                            <Check size={15} />
+                            {reviewedSet.has(batchReviewItem.id) ? "已标记审查" : "标记为已审查"}
+                          </button>
+                        </footer>
+                      </>
+                    ) : (
+                      <div className="asset-batch-empty"><ListChecks size={26} />请选择一项资产审查提示词</div>
+                    )}
+                  </section>
+                </div>
+
+                <footer className="asset-batch-footer">
+                  <div>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={batchAcknowledged}
+                        disabled={!allSelectedReviewed}
+                        onChange={(event) => setBatchAcknowledged(event.target.checked)}
+                      />
+                      我已逐项审查以上提示词，并确认后续排队将消耗 {selectedBatchItems.length} 次图像生成额度。
+                    </label>
+                    <small>
+                      {selectedBatchItems.length === 0
+                        ? "请至少选择一项已确认资产。"
+                        : allSelectedReviewed
+                          ? "审查已完成，可以保存生产清单。"
+                          : `还有 ${selectedBatchItems.filter((item) => !reviewedSet.has(item.id)).length} 项提示词未标记审查。`}
+                    </small>
+                    {error ? <span className="asset-batch-error">{error}</span> : null}
+                  </div>
+                  <div>
+                    <button className="button secondary compact" type="button" onClick={() => setBatchOpen(false)}>关闭</button>
+                    {!imageModelConfigured ? (
+                      <button className="button secondary compact" type="button" onClick={onOpenApiSettings}>配置图像模型</button>
+                    ) : (
+                      <button
+                        className="button primary compact"
+                        type="button"
+                        disabled={!batchAcknowledged || !allSelectedReviewed || batchSaving}
+                        onClick={handleConfirmBatchPlan}
+                      >
+                        {batchSaving ? <LoaderCircle className="spinning" size={15} /> : <ShieldCheck size={15} />}
+                        {batchSaving ? "正在保存…" : "确认清单（暂不生成）"}
+                      </button>
+                    )}
+                  </div>
+                </footer>
+              </div>
+            </div>
+          ) : null}
         </>
       )}
     </main>

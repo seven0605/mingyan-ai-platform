@@ -304,6 +304,27 @@ export interface AssetLibrary {
   items: AssetItem[];
 }
 
+export interface AssetBatchPlanItem {
+  assetId: string;
+  assetKind: AssetKind;
+  name: string;
+  prompt: string;
+  aspectRatio: string;
+  existingVersionCount: number;
+}
+
+export interface AssetBatchPlan {
+  projectId: string;
+  items: AssetBatchPlanItem[];
+  estimatedUnitCost: number | null;
+  estimatedTotalCost: number | null;
+  costSampleCount: number;
+  assetLibraryUpdatedAt: string;
+  confirmedAt: string;
+  current: boolean;
+  updatedAt: string;
+}
+
 export type ProjectTaskStatus = "queued" | "running" | "completed" | "failed";
 
 export interface ProjectTask {
