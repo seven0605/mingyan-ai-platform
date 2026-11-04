@@ -27,6 +27,7 @@ import {
   generateAssetReferenceImage,
   getAssetBatchPlan,
   getAssetLibrary,
+  getProjectTasks,
   getScreenplay,
   getStoryboards,
   queueAssetBatchPlan,
@@ -50,6 +51,7 @@ import type {
   AssetVisualStandard,
   CostumeEra,
   Project,
+  ProjectTask,
   Screenplay,
   Storyboard,
 } from "../types";
@@ -122,6 +124,7 @@ export function AssetWorkspace({
     compiled: CompiledAssetPrompt;
   } | null>(null);
   const [batchPlan, setBatchPlan] = useState<AssetBatchPlan | null>(null);
+  const [batchTasks, setBatchTasks] = useState<ProjectTask[]>([]);
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchSelectedIds, setBatchSelectedIds] = useState<string[]>([]);
   const [batchReviewId, setBatchReviewId] = useState<string | null>(null);
@@ -138,6 +141,7 @@ export function AssetWorkspace({
       setStoryboards([]);
       setLibrary(null);
       setBatchPlan(null);
+      setBatchTasks([]);
       return;
     }
     let active = true;
@@ -148,8 +152,9 @@ export function AssetWorkspace({
       getStoryboards(project.id),
       getAssetLibrary(project.id),
       getAssetBatchPlan(project.id),
+      getProjectTasks(project.id),
     ])
-      .then(([screenplayResult, storyboardResult, libraryResult, batchPlanResult]) => {
+      .then(([screenplayResult, storyboardResult, libraryResult, batchPlanResult, taskResult]) => {
         if (!active) return;
         setScreenplay(screenplayResult);
         setStoryboards(storyboardResult);
@@ -157,6 +162,7 @@ export function AssetWorkspace({
         setSavedSignature(editableLibrarySignature(libraryResult));
         setSelectedId(libraryResult?.items[0]?.id ?? null);
         setBatchPlan(batchPlanResult);
+        setBatchTasks(taskResult);
       })
       .catch((loadError: unknown) => {
         if (active) {
@@ -228,6 +234,13 @@ export function AssetWorkspace({
     && batchPlan.items.length === selectedBatchItems.length
     && batchPlan.items.every((item) => batchSelectedIds.includes(item.assetId)),
   );
+  const latestBatchId = batchTasks.find((task) => task.batchId)?.batchId;
+  const latestBatchTasks = latestBatchId
+    ? batchTasks.filter((task) => task.batchId === latestBatchId)
+    : [];
+  const latestBatchCompleted = latestBatchTasks.filter((task) => task.status === "completed").length;
+  const latestBatchActive = latestBatchTasks.filter((task) => task.status === "queued" || task.status === "running").length;
+  const latestBatchNeedsAction = latestBatchTasks.length - latestBatchCompleted - latestBatchActive;
   const libraryCurrent = Boolean(
     library
     && screenplay
@@ -439,7 +452,8 @@ export function AssetWorkspace({
     setBatchQueueing(true);
     setError(null);
     try {
-      await queueAssetBatchPlan(project.id);
+      const queuedTasks = await queueAssetBatchPlan(project.id);
+      setBatchTasks((current) => [...queuedTasks, ...current]);
       setBatchAcknowledged(false);
       setBatchOpen(false);
     } catch (queueError) {
@@ -610,7 +624,9 @@ export function AssetWorkspace({
             <div><span>待完善</span><strong>{library.items.length - confirmedCount}</strong></div>
             <div><span>已有参考图</span><strong>{generatedCount}</strong></div>
             <p>
-              {batchPlan?.current
+              {latestBatchTasks.length
+                ? `最近批次 ${latestBatchTasks.length} 项：已完成 ${latestBatchCompleted}，执行中 ${latestBatchActive}，待处理 ${latestBatchNeedsAction}。`
+                : batchPlan?.current
                 ? `已确认 ${batchPlan.items.length} 项生产清单；当前阶段尚未排队或消耗额度。`
                 : batchPlan
                   ? "已有生产清单因资产发生变化而过期，请重新审查确认。"
