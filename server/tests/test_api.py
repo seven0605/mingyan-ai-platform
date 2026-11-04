@@ -335,7 +335,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
                 assert request_payload["params"]["images"][0].startswith(
                     "data:image/png;base64,"
                 )
-                assert "V1身份参考硬锁" in request_payload["prompt"]
+                assert "单一身份母版硬锁" in request_payload["prompt"]
             return httpx.Response(
                 200,
                 json={"code": 200, "data": {"task_id": "image-task-1"}},
@@ -381,11 +381,12 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             assert "用于e1-g1" in request_payload["prompt"]
             assert "用于e1-g2" in request_payload["prompt"]
             assert "同名人物跨镜头组必须保持同一身份" in request_payload["prompt"]
+            assert "身份母版为最高优先级" in request_payload["prompt"]
             assert request_payload["size"] == "1280x720"
             reference_urls = request_payload["metadata"]["__workbench_refs"][
                 "reference_image_urls"
             ]
-            assert len(reference_urls) >= 2
+            assert len(reference_urls) >= 3
             assert all(
                 url.startswith("https://assets.example.com/")
                 for url in reference_urls
@@ -954,6 +955,29 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert local_image.headers["content-type"] == "image/png"
         assert local_image.content.startswith(b"\x89PNG")
 
+        blocked_followup = client.post(
+            f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images"
+        )
+        assert blocked_followup.status_code == 409
+        assert "剧情状态图" in blocked_followup.json()["detail"]
+        identity_master_result = client.post(
+            f"/api/projects/{project['id']}/assets/{yun_zishu_id}/identity-masters",
+            json={
+                "sourceImageId": generated_image["id"],
+                "imageData": "data:image/png;base64,iVBORw0KGgo=",
+            },
+        )
+        assert identity_master_result.status_code == 200
+        identity_yun_zishu = next(
+            item
+            for item in identity_master_result.json()["items"]
+            if item["name"] == "云子姝"
+        )
+        identity_master = identity_yun_zishu["identityMasters"][0]
+        assert identity_yun_zishu["identityMasterId"] == identity_master["id"]
+        assert identity_master["sourceImageId"] == generated_image["id"]
+        assert client.get(identity_master["url"]).content.startswith(b"\x89PNG")
+
         batch_plan = client.post(
             f"/api/projects/{project['id']}/assets/batch-plan",
             json={"assetIds": [yun_zishu_id]},
@@ -969,7 +993,12 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
 
         image_generation_failed = True
         failed_image_generation = client.post(
-            f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images"
+            f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images",
+            json={
+                "mode": "state",
+                "stateLabel": "失败状态测试",
+                "statePrompt": "素白寝衣、长发披散",
+            },
         )
         assert failed_image_generation.status_code == 502
         preserved_after_image_failure = client.get(
@@ -983,7 +1012,12 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         image_generation_failed = False
 
         second_generation = client.post(
-            f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images"
+            f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images",
+            json={
+                "mode": "state",
+                "stateLabel": "寝衣重生状态",
+                "statePrompt": "素白寝衣、长发凌乱、病后虚弱、眼神冷冽",
+            },
         )
         assert second_generation.status_code == 200
         second_yun_zishu = next(
@@ -997,8 +1031,11 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             f"/api/projects/{project['id']}/assets/batch-plan"
         ).json()["current"] is False
         second_image = second_yun_zishu["referenceImages"][1]
-        assert second_image["identityReferenceImageId"] == generated_image["id"]
-        assert "V1身份参考硬锁" in second_image["prompt"]
+        assert second_image["identityReferenceImageId"] == identity_master["id"]
+        assert second_image["role"] == "state"
+        assert second_image["stateLabel"] == "寝衣重生状态"
+        assert "单一身份母版硬锁" in second_image["prompt"]
+        assert "不得输出四宫格" in second_image["prompt"]
         assert len(client.get(f"/api/projects/{project['id']}/tasks").json()) == 2
         missing_primary = client.put(
             f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images/00000000-0000-4000-8000-000000000000/primary"
@@ -1059,9 +1096,29 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             },
         )
         assert saved_video_assets.status_code == 200
-        assert client.post(
+        generated_xiao_result = client.post(
             f"/api/projects/{project['id']}/assets/{xiao_yunheng_id}/images"
-        ).status_code == 200
+        )
+        assert generated_xiao_result.status_code == 200
+        generated_xiao = next(
+            item
+            for item in generated_xiao_result.json()["items"]
+            if item["name"] == "萧云衡"
+        )
+        xiao_image = generated_xiao["referenceImages"][0]
+        xiao_master_result = client.post(
+            f"/api/projects/{project['id']}/assets/{xiao_yunheng_id}/identity-masters",
+            json={
+                "sourceImageId": xiao_image["id"],
+                "imageData": "data:image/png;base64,iVBORw0KGgo=",
+            },
+        )
+        assert xiao_master_result.status_code == 200
+        xiao_master = next(
+            item
+            for item in xiao_master_result.json()["items"]
+            if item["name"] == "萧云衡"
+        )["identityMasters"][0]
 
         video_plan = client.get(f"/api/projects/{project['id']}/video-plan")
         assert video_plan.status_code == 200
@@ -1078,6 +1135,15 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             if reference["assetId"] == yun_zishu_id
         )
         assert len(first_yun_reference["availableImages"]) == 2
+        assert first_yun_reference["availableImages"][0]["identityMasterId"] == (
+            identity_master["id"]
+        )
+        first_xiao_reference = next(
+            reference
+            for reference in video_plan.json()["items"][0]["assetReferences"]
+            if reference["assetId"] == xiao_yunheng_id
+        )
+        assert first_xiao_reference["identityMasterId"] == xiao_master["id"]
         reference_image_ids = {
             selected_video_ids[0]: {yun_zishu_id: generated_image["id"]},
             selected_video_ids[1]: {yun_zishu_id: second_image["id"]},

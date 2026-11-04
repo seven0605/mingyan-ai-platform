@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
@@ -353,6 +354,15 @@ class AssetImageVersion(BaseModel):
     resolution: str
     cost: float | None = None
     identityReferenceImageId: str = ""
+    role: Literal["asset-card", "state"] = "asset-card"
+    stateLabel: str = ""
+    createdAt: str
+
+
+class AssetIdentityMaster(BaseModel):
+    id: str
+    url: str
+    sourceImageId: str
     createdAt: str
 
 
@@ -370,6 +380,8 @@ class AssetItem(BaseModel):
     promptStandardSignature: str = ""
     referenceImages: list[AssetImageVersion] = Field(default_factory=list)
     primaryReferenceImageId: str | None = None
+    identityMasters: list[AssetIdentityMaster] = Field(default_factory=list)
+    identityMasterId: str | None = None
 
     @model_validator(mode="after")
     def validate_primary_reference_image(self) -> "AssetItem":
@@ -378,7 +390,28 @@ class AssetItem(BaseModel):
             raise ValueError("主参考图必须来自当前资产的历史版本")
         if self.referenceImages and not self.primaryReferenceImageId:
             self.primaryReferenceImageId = self.referenceImages[0].id
+        identity_master_ids = {master.id for master in self.identityMasters}
+        if self.identityMasterId and self.identityMasterId not in identity_master_ids:
+            raise ValueError("身份母版必须来自当前角色的母版历史")
+        if self.identityMasters and not self.identityMasterId:
+            self.identityMasterId = self.identityMasters[0].id
         return self
+
+
+class AssetIdentityMasterCreate(BaseModel):
+    sourceImageId: str
+    imageData: str = Field(min_length=32, max_length=14_000_000)
+
+
+class AssetImageGenerateRequest(BaseModel):
+    mode: Literal["asset-card", "state"] = "asset-card"
+    stateLabel: str = Field(default="", max_length=80)
+    statePrompt: str = Field(default="", max_length=4000)
+
+    @field_validator("stateLabel", "statePrompt")
+    @classmethod
+    def strip_state_text(cls, value: str) -> str:
+        return value.strip()
 
 
 class AssetStandardSettings(BaseModel):
@@ -489,6 +522,8 @@ class VideoPlanAssetImageOption(BaseModel):
     url: str
     label: str
     identityReferenceImageId: str = ""
+    identityMasterId: str = ""
+    identityMasterUrl: str = ""
 
 
 class VideoPlanAssetReference(BaseModel):
@@ -498,6 +533,8 @@ class VideoPlanAssetReference(BaseModel):
     imageId: str
     imageUrl: str
     direct: bool
+    identityMasterId: str = ""
+    identityMasterUrl: str = ""
     availableImages: list[VideoPlanAssetImageOption]
 
 
@@ -922,15 +959,40 @@ def build_video_plan_items(
                 elif direct and requires_reference and primary is None:
                     blocking_reasons.append(f"{asset.name} 缺少主参考图")
                 if primary is not None and asset.status == "confirmed":
-                    available_images = [
-                        VideoPlanAssetImageOption(
-                            id=image.id,
-                            url=image.url,
-                            label=f"V{index + 1}",
-                            identityReferenceImageId=image.identityReferenceImageId,
+                    identity_masters_by_id = {
+                        master.id: master for master in asset.identityMasters
+                    }
+                    active_identity_master = identity_masters_by_id.get(
+                        asset.identityMasterId or ""
+                    )
+                    available_images: list[VideoPlanAssetImageOption] = []
+                    for index, image in enumerate(asset.referenceImages):
+                        identity_master = identity_masters_by_id.get(
+                            image.identityReferenceImageId
+                        ) or active_identity_master
+                        available_images.append(
+                            VideoPlanAssetImageOption(
+                                id=image.id,
+                                url=image.url,
+                                label=(
+                                    f"V{index + 1} · {image.stateLabel}"
+                                    if image.role == "state" and image.stateLabel
+                                    else f"V{index + 1} · 资产卡"
+                                ),
+                                identityReferenceImageId=(
+                                    image.identityReferenceImageId
+                                ),
+                                identityMasterId=(
+                                    identity_master.id if identity_master else ""
+                                ),
+                                identityMasterUrl=(
+                                    identity_master.url if identity_master else ""
+                                ),
+                            )
                         )
-                        for index, image in enumerate(asset.referenceImages)
-                    ]
+                    primary_option = next(
+                        image for image in available_images if image.id == primary.id
+                    )
                     references.append(
                         VideoPlanAssetReference(
                             assetId=asset.id,
@@ -939,6 +1001,8 @@ def build_video_plan_items(
                             imageId=primary.id,
                             imageUrl=primary.url,
                             direct=direct,
+                            identityMasterId=primary_option.identityMasterId,
+                            identityMasterUrl=primary_option.identityMasterUrl,
                             availableImages=available_images,
                         )
                     )
@@ -986,6 +1050,8 @@ def apply_video_reference_image_ids(
             if option is not None:
                 reference.imageId = option.id
                 reference.imageUrl = option.url
+                reference.identityMasterId = option.identityMasterId
+                reference.identityMasterUrl = option.identityMasterUrl
 
 
 def asset_library_tasks(row: sqlite3.Row) -> list[ProjectTaskOut]:
@@ -1764,39 +1830,67 @@ def create_app(
             None,
         )
 
+    def asset_identity_master_file_path(
+        project_id: str, asset_id: str, master_id: str
+    ) -> Path | None:
+        image_dir = resolved_data_dir / "generated" / project_id / asset_id
+        return next(
+            (
+                path
+                for suffix in (".png", ".jpg", ".jpeg", ".webp")
+                if (path := image_dir / f"identity-{master_id}{suffix}").is_file()
+            ),
+            None,
+        )
+
     def identity_reference_for_asset(
         project_id: str, asset: AssetItem
     ) -> tuple[str, str]:
         if (
             asset.kind != "character"
             or is_collective_character(asset.kind, asset.name)
-            or not asset.referenceImages
         ):
             return "", ""
-        reference = asset.referenceImages[0]
-        image_dir = resolved_data_dir / "generated" / project_id / asset.id
+        if not asset.referenceImages:
+            return "", ""
+        if not asset.identityMasterId:
+            raise HTTPException(
+                status_code=409,
+                detail=f"请先为{asset.name}建立单张正脸身份母版，再生成后续版本",
+            )
+        reference = next(
+            (
+                master
+                for master in asset.identityMasters
+                if master.id == asset.identityMasterId
+            ),
+            None,
+        )
+        if reference is None:
+            raise HTTPException(status_code=409, detail=f"{asset.name} 的身份母版记录无效")
+        image_path = asset_identity_master_file_path(
+            project_id, asset.id, reference.id
+        )
+        if image_path is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{asset.name} 的身份母版文件缺失，无法执行身份硬控",
+            )
         suffix_mime = {
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".webp": "image/webp",
         }
-        for suffix, mime_type in suffix_mime.items():
-            image_path = image_dir / f"{reference.id}{suffix}"
-            if not image_path.is_file():
-                continue
-            image_bytes = image_path.read_bytes()
-            if not image_bytes or len(image_bytes) > 10 * 1024 * 1024:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"{asset.name} 的 V1 人脸参考图为空或超过 10MB",
-                )
-            encoded = base64.b64encode(image_bytes).decode("ascii")
-            return f"data:{mime_type};base64,{encoded}", reference.id
-        raise HTTPException(
-            status_code=409,
-            detail=f"{asset.name} 的 V1 人脸参考图文件缺失，无法执行身份硬控",
-        )
+        image_bytes = image_path.read_bytes()
+        if not image_bytes or len(image_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{asset.name} 的身份母版为空或超过 10MB",
+            )
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        mime_type = suffix_mime[image_path.suffix.lower()]
+        return f"data:{mime_type};base64,{encoded}", reference.id
 
     def generation_request_for_asset(
         project_id: str, asset: AssetItem, base_prompt: str
@@ -1807,14 +1901,26 @@ def create_app(
         if not reference_id:
             return base_prompt, {}, ""
         identity_lock = (
-            "【V1身份参考硬锁｜最高优先级】以随请求附带的V1参考图中的人物面部作为唯一身份基准。"
+            "【单一身份母版硬锁｜最高优先级】图1只包含一个人的正脸，必须把该面部作为唯一身份基准。"
             "必须保留同一张脸、骨相、五官比例、年龄、肤色和身体比例；只允许按照本次提示更换服装、"
-            "配饰、发型、妆容与剧情状态。禁止重新选角，禁止生成相似但不同的人，禁止让文字描述覆盖V1面部身份。"
+            "配饰、发型、妆容与剧情状态。禁止重新选角，禁止生成相似但不同的人，禁止让文字描述覆盖身份母版。"
         )
         return (
             f"{identity_lock}\n\n{base_prompt}",
             {"images": [reference_data_uri]},
             reference_id,
+        )
+
+    def state_image_prompt(asset: AssetItem, request: AssetImageGenerateRequest) -> str:
+        if not request.stateLabel or not request.statePrompt:
+            raise HTTPException(status_code=422, detail="剧情状态名称和状态描述不能为空")
+        return (
+            f"定向生成人物 {asset.name} 的剧情状态图：{request.stateLabel}。\n\n"
+            f"CHANGE：仅将服装、发型、配饰、妆容、伤势、表情与姿态调整为：{request.statePrompt}\n\n"
+            "PRESERVE EXACTLY：图1身份母版中的脸、骨相、五官间距、眼型、鼻型、唇形、年龄、"
+            "肤色与人物辨识度必须完全一致。生成单张真人摄影画面，只出现同一个人物；采用中性影棚背景，"
+            "人物从头到脚完整入镜，正面或轻微四分之三角度，面部清晰可辨。\n\n"
+            "ONLY CHANGE：上述剧情状态。不得输出四宫格、拼图、多人、多张脸、文字、标签或资产卡排版。"
         )
 
     def process_generation_job(job_id: str) -> None:
@@ -1845,11 +1951,16 @@ def create_app(
             )
             if job_asset is None:
                 raise HTTPException(status_code=404, detail="资产不存在")
-            request_prompt, reference_params, identity_reference_id = (
-                generation_request_for_asset(
-                    job["project_id"], job_asset, job["prompt"]
+            if provider_task_id and not job_asset.identityMasterId:
+                request_prompt = job["prompt"]
+                reference_params: dict[str, list[str]] = {}
+                identity_reference_id = ""
+            else:
+                request_prompt, reference_params, identity_reference_id = (
+                    generation_request_for_asset(
+                        job["project_id"], job_asset, job["prompt"]
+                    )
                 )
-            )
             settings, api_key = image_model_credentials()
             api_root = settings.baseUrl if settings.baseUrl.endswith("/v1") else f"{settings.baseUrl}/v1"
             headers = {"Authorization": f"Bearer {api_key}"}
@@ -2123,11 +2234,18 @@ def create_app(
                     files: dict[str, Path] = {}
                     for reference in references:
                         logical_id = str(reference["logicalId"])
-                        image_path = asset_reference_file_path(
-                            job["project_id"],
-                            str(reference["assetId"]),
-                            str(reference["imageId"]),
-                        )
+                        if reference.get("role") == "identity":
+                            image_path = asset_identity_master_file_path(
+                                job["project_id"],
+                                str(reference["assetId"]),
+                                str(reference["imageId"]),
+                            )
+                        else:
+                            image_path = asset_reference_file_path(
+                                job["project_id"],
+                                str(reference["assetId"]),
+                                str(reference["imageId"]),
+                            )
                         if image_path is None:
                             raise HTTPException(
                                 status_code=409,
@@ -2144,9 +2262,15 @@ def create_app(
                     for index, reference in enumerate(references, start=1):
                         item_ids = reference.get("itemIds", [])
                         scope = f"（用于{'、'.join(item_ids)}）" if item_ids else ""
-                        reference_guide_parts.append(
-                            f"图{index}={reference['name']}{scope}"
-                        )
+                        if reference.get("role") == "identity":
+                            reference_guide_parts.append(
+                                f"图{index}={reference['name']}·身份母版"
+                                "（只锁定脸、骨相、年龄与人物身份，全片唯一）"
+                            )
+                        else:
+                            reference_guide_parts.append(
+                                f"图{index}={reference['name']}·镜头状态{scope}"
+                            )
                     reference_guide = "；".join(reference_guide_parts)
                     created = client.post(
                         f"{api_root}/videos",
@@ -2155,7 +2279,8 @@ def create_app(
                             "model": job["model"],
                             "prompt": (
                                 f"【参考图顺序锁定】{reference_guide}。"
-                                "人物身份、服装和场景分别以对应参考图为准；"
+                                "人物身份以身份母版为最高优先级；服装、发型、伤势与情绪只读取对应镜头状态图；"
+                                "场景以对应场景参考图为准；"
                                 "同名人物跨镜头组必须保持同一身份，仅允许服装、发型、"
                                 "伤势和情绪状态变化。\n\n"
                                 f"{job['prompt']}"
@@ -3696,6 +3821,22 @@ def create_app(
         files: dict[str, Path] = {}
         for item in items:
             for reference in item.assetReferences:
+                if reference.identityMasterId:
+                    identity_logical_id = (
+                        f"identity:{reference.assetId}:{reference.identityMasterId}"
+                    )
+                    if identity_logical_id not in files:
+                        identity_path = asset_identity_master_file_path(
+                            project_id,
+                            reference.assetId,
+                            reference.identityMasterId,
+                        )
+                        if identity_path is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=f"{reference.name} 的身份母版文件不存在",
+                            )
+                        files[identity_logical_id] = identity_path
                 logical_id = f"{reference.assetId}:{reference.imageId}"
                 if logical_id in files:
                     continue
@@ -3868,6 +4009,28 @@ def create_app(
                 references_by_id: dict[str, dict[str, object]] = {}
                 for item in items:
                     for reference in item.assetReferences:
+                        if reference.identityMasterId:
+                            identity_logical_id = (
+                                f"identity:{reference.assetId}:"
+                                f"{reference.identityMasterId}"
+                            )
+                            identity_reference = references_by_id.setdefault(
+                                identity_logical_id,
+                                {
+                                    "logicalId": identity_logical_id,
+                                    "assetId": reference.assetId,
+                                    "imageId": reference.identityMasterId,
+                                    "name": reference.name,
+                                    "role": "identity",
+                                    "itemIds": [],
+                                },
+                            )
+                            identity_item_ids = identity_reference["itemIds"]
+                            if (
+                                isinstance(identity_item_ids, list)
+                                and item.id not in identity_item_ids
+                            ):
+                                identity_item_ids.append(item.id)
                         logical_id = f"{reference.assetId}:{reference.imageId}"
                         saved_reference = references_by_id.setdefault(
                             logical_id,
@@ -3876,6 +4039,7 @@ def create_app(
                                 "assetId": reference.assetId,
                                 "imageId": reference.imageId,
                                 "name": reference.name,
+                                "role": "state",
                                 "itemIds": [],
                             },
                         )
@@ -4137,6 +4301,15 @@ def create_app(
                     status_code=409,
                     detail=f"{plan_item.name} 已发生变化，请重新确认生产清单",
                 )
+            if (
+                asset.kind == "character"
+                and not is_collective_character(asset.kind, asset.name)
+                and asset.referenceImages
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{asset.name} 已有资产卡，后续版本请使用剧情状态图生成",
+                )
 
         batch_id = str(uuid4())
         with connect(database_path) as connection:
@@ -4347,6 +4520,35 @@ def create_app(
         ]
 
     @application.get(
+        "/api/projects/{project_id}/assets/{asset_id}/identity-masters/{master_id}"
+    )
+    def get_asset_identity_master(
+        project_id: str, asset_id: str, master_id: str
+    ) -> FileResponse:
+        try:
+            UUID(project_id)
+            UUID(asset_id)
+            UUID(master_id)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail="身份母版不存在") from error
+        with connect(database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="资产库不存在")
+        library = AssetLibraryPayload.model_validate(json.loads(row["payload"]))
+        asset = next((item for item in library.items if item.id == asset_id), None)
+        if asset is None or not any(
+            master.id == master_id for master in asset.identityMasters
+        ):
+            raise HTTPException(status_code=404, detail="身份母版不存在")
+        image_path = asset_identity_master_file_path(project_id, asset_id, master_id)
+        if image_path is None:
+            raise HTTPException(status_code=404, detail="本地身份母版文件不存在")
+        return FileResponse(image_path)
+
+    @application.get(
         "/api/projects/{project_id}/assets/{asset_id}/images/{image_id}"
     )
     def get_asset_reference_image(
@@ -4526,11 +4728,118 @@ def create_app(
         return row_to_asset_library(saved)
 
     @application.post(
+        "/api/projects/{project_id}/assets/{asset_id}/identity-masters",
+        response_model=AssetLibraryOut,
+    )
+    def create_asset_identity_master(
+        project_id: str,
+        asset_id: str,
+        request: AssetIdentityMasterCreate,
+    ) -> AssetLibraryOut:
+        try:
+            UUID(project_id)
+            UUID(asset_id)
+            UUID(request.sourceImageId)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail="角色参考图不存在") from error
+        with connect(database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="资产库不存在")
+        library = AssetLibraryPayload.model_validate(json.loads(row["payload"]))
+        asset = next((item for item in library.items if item.id == asset_id), None)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="角色不存在")
+        if asset.kind != "character" or is_collective_character(asset.kind, asset.name):
+            raise HTTPException(status_code=409, detail="身份母版只适用于单人角色")
+        if not any(
+            image.id == request.sourceImageId for image in asset.referenceImages
+        ):
+            raise HTTPException(status_code=404, detail="身份母版来源图不存在")
+
+        matched = re.fullmatch(
+            r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)",
+            request.imageData,
+        )
+        if matched is None:
+            raise HTTPException(status_code=422, detail="身份母版必须是 PNG、JPEG 或 WebP 图片")
+        mime_type, encoded = matched.groups()
+        try:
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise HTTPException(status_code=422, detail="身份母版图片数据无效") from error
+        signatures = {
+            "image/png": (b"\x89PNG\r\n\x1a\n", ".png"),
+            "image/jpeg": (b"\xff\xd8\xff", ".jpg"),
+            "image/webp": (b"RIFF", ".webp"),
+        }
+        signature, suffix = signatures[mime_type]
+        if (
+            not image_bytes.startswith(signature)
+            or not image_bytes
+            or len(image_bytes) > 10 * 1024 * 1024
+        ):
+            raise HTTPException(status_code=422, detail="身份母版图片为空、格式错误或超过 10MB")
+
+        now = utc_now()
+        master_id = str(uuid4())
+        image_dir = resolved_data_dir / "generated" / project_id / asset_id
+        image_dir.mkdir(parents=True, exist_ok=True)
+        image_path = image_dir / f"identity-{master_id}{suffix}"
+        temporary_path = image_dir / f".identity-{master_id}.tmp"
+        temporary_path.write_bytes(image_bytes)
+        temporary_path.replace(image_path)
+        master = AssetIdentityMaster(
+            id=master_id,
+            url=(
+                f"/api/projects/{project_id}/assets/{asset_id}/"
+                f"identity-masters/{master_id}"
+            ),
+            sourceImageId=request.sourceImageId,
+            createdAt=now,
+        )
+        updated_library = library.model_copy(
+            update={
+                "items": [
+                    item.model_copy(
+                        update={
+                            "identityMasters": [*item.identityMasters, master],
+                            "identityMasterId": master.id,
+                        }
+                    )
+                    if item.id == asset_id
+                    else item
+                    for item in library.items
+                ]
+            }
+        )
+        try:
+            with connect(database_path) as connection:
+                connection.execute(
+                    "UPDATE project_assets SET payload = ?, updated_at = ? WHERE project_id = ?",
+                    (updated_library.model_dump_json(), now, project_id),
+                )
+                connection.execute(
+                    "UPDATE projects SET updated_at = ? WHERE id = ?", (now, project_id)
+                )
+                saved = connection.execute(
+                    "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
+                ).fetchone()
+        except sqlite3.Error:
+            image_path.unlink(missing_ok=True)
+            raise
+        return row_to_asset_library(saved)
+
+    @application.post(
         "/api/projects/{project_id}/assets/{asset_id}/images",
         response_model=AssetLibraryOut,
     )
     def generate_asset_reference_image(
-        project_id: str, asset_id: str
+        project_id: str,
+        asset_id: str,
+        request: AssetImageGenerateRequest | None = None,
     ) -> AssetLibraryOut:
         try:
             UUID(project_id)
@@ -4565,12 +4874,32 @@ def create_app(
                 detail="该资产尚未按当前资产标准重编提示词",
             )
 
+        generation_request = request or AssetImageGenerateRequest()
+        if (
+            generation_request.mode == "asset-card"
+            and asset.kind == "character"
+            and not is_collective_character(asset.kind, asset.name)
+            and asset.referenceImages
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="单人角色只生成一张初始资产卡，后续必须从身份母版生成剧情状态图",
+            )
+        if generation_request.mode == "state":
+            if asset.kind != "character" or is_collective_character(
+                asset.kind, asset.name
+            ):
+                raise HTTPException(status_code=409, detail="剧情状态图只适用于单人角色")
+            base_prompt = state_image_prompt(asset, generation_request)
+        else:
+            base_prompt = asset.referencePrompt
+
         settings, api_key = image_model_credentials()
         aspect_ratio = asset_aspect_ratio(
             library.standard.visualStandard, asset.kind, asset.name
         )
         request_prompt, reference_params, identity_reference_id = (
-            generation_request_for_asset(project_id, asset, asset.referencePrompt)
+            generation_request_for_asset(project_id, asset, base_prompt)
         )
         api_root = settings.baseUrl if settings.baseUrl.endswith("/v1") else f"{settings.baseUrl}/v1"
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -4681,6 +5010,12 @@ def create_app(
             resolution="1K",
             cost=cost,
             identityReferenceImageId=identity_reference_id,
+            role=generation_request.mode,
+            stateLabel=(
+                generation_request.stateLabel
+                if generation_request.mode == "state"
+                else ""
+            ),
             createdAt=now,
         )
         updated_library = library.model_copy(

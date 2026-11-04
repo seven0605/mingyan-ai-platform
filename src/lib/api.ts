@@ -284,10 +284,34 @@ export function saveAssetLibrary(projectId: string, library: AssetLibrary) {
   });
 }
 
-export function generateAssetReferenceImage(projectId: string, assetId: string) {
+export function generateAssetReferenceImage(
+  projectId: string,
+  assetId: string,
+  options?: {
+    mode: "asset-card" | "state";
+    stateLabel?: string;
+    statePrompt?: string;
+  },
+) {
   return request<AssetLibrary>(`/api/projects/${projectId}/assets/${assetId}/images`, {
     method: "POST",
+    body: options ? JSON.stringify(options) : undefined,
   });
+}
+
+export function createAssetIdentityMaster(
+  projectId: string,
+  assetId: string,
+  sourceImageId: string,
+  imageData: string,
+) {
+  return request<AssetLibrary>(
+    `/api/projects/${projectId}/assets/${assetId}/identity-masters`,
+    {
+      method: "POST",
+      body: JSON.stringify({ sourceImageId, imageData }),
+    },
+  );
 }
 
 export function setPrimaryAssetReferenceImage(

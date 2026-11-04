@@ -23,6 +23,7 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import {
   confirmAssetBatchPlan,
+  createAssetIdentityMaster,
   extractAssetLibrary,
   generateAssetReferenceImage,
   getAssetBatchPlan,
@@ -108,6 +109,83 @@ function formatCost(value: number) {
   return value.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
 }
 
+async function cropIdentityPortrait(imageUrl: string) {
+  const response = await fetch(imageUrl);
+  if (!response.ok) throw new Error("身份母版来源图读取失败");
+  const bitmap = await createImageBitmap(await response.blob());
+  const legacyMultiPanel = bitmap.width / bitmap.height >= 0.7;
+  const analysisCanvas = document.createElement("canvas");
+  analysisCanvas.width = bitmap.width;
+  analysisCanvas.height = bitmap.height;
+  const analysisContext = analysisCanvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+  if (!analysisContext) {
+    bitmap.close();
+    throw new Error("当前浏览器无法分析身份母版来源图");
+  }
+  analysisContext.drawImage(bitmap, 0, 0);
+  const firstRowBoundary = Math.round(bitmap.height / 3);
+  const seamWidth = Math.round(bitmap.width * 2 / 3);
+  const rowAbove = analysisContext.getImageData(
+    0,
+    firstRowBoundary - 2,
+    seamWidth,
+    1,
+  ).data;
+  const rowBelow = analysisContext.getImageData(
+    0,
+    firstRowBoundary + 2,
+    seamWidth,
+    1,
+  ).data;
+  let seamDifference = 0;
+  for (let index = 0; index < rowAbove.length; index += 4) {
+    seamDifference += Math.abs(rowAbove[index] - rowBelow[index]);
+    seamDifference += Math.abs(rowAbove[index + 1] - rowBelow[index + 1]);
+    seamDifference += Math.abs(rowAbove[index + 2] - rowBelow[index + 2]);
+  }
+  const twoColumnThreeRowGrid = legacyMultiPanel
+    && seamDifference / (seamWidth * 3) > 20;
+  const panelWidth = bitmap.width * (
+    twoColumnThreeRowGrid ? 1 / 2 : legacyMultiPanel ? 2 / 3 : 1 / 2
+  );
+  const panelHeight = bitmap.height * (
+    twoColumnThreeRowGrid ? 1 / 3 : legacyMultiPanel ? 2 / 3 : 1 / 2
+  );
+  const cropSize = Math.min(
+    panelWidth * (twoColumnThreeRowGrid ? 0.72 : legacyMultiPanel ? 0.72 : 0.88),
+    panelHeight * (twoColumnThreeRowGrid ? 0.81 : 0.58),
+  );
+  const centerX = panelWidth * (twoColumnThreeRowGrid ? 0.64 : 0.5);
+  const centerY = panelHeight * (
+    twoColumnThreeRowGrid ? 0.48 : legacyMultiPanel ? 0.36 : 0.34
+  );
+  const sourceX = Math.max(0, Math.min(bitmap.width - cropSize, centerX - cropSize / 2));
+  const sourceY = Math.max(0, Math.min(bitmap.height - cropSize, centerY - cropSize / 2));
+  const canvas = document.createElement("canvas");
+  canvas.width = 640;
+  canvas.height = 640;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    bitmap.close();
+    throw new Error("当前浏览器无法创建身份母版");
+  }
+  context.drawImage(
+    bitmap,
+    sourceX,
+    sourceY,
+    cropSize,
+    cropSize,
+    0,
+    0,
+    canvas.width,
+    canvas.height,
+  );
+  bitmap.close();
+  return canvas.toDataURL("image/png");
+}
+
 export function AssetWorkspace({
   project,
   onBack,
@@ -129,6 +207,9 @@ export function AssetWorkspace({
   const [previewImageId, setPreviewImageId] = useState<string | null>(null);
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [settingPrimary, setSettingPrimary] = useState(false);
+  const [buildingIdentityMaster, setBuildingIdentityMaster] = useState(false);
+  const [stateLabel, setStateLabel] = useState("");
+  const [statePrompt, setStatePrompt] = useState("");
   const [promptPreview, setPromptPreview] = useState<{
     assetId: string;
     compiled: CompiledAssetPrompt;
@@ -208,6 +289,17 @@ export function AssetWorkspace({
   const selectedIsCollective = selectedItem
     ? isCollectiveCharacter(selectedItem.kind, selectedItem.name)
     : false;
+  const identityMaster = selectedItem?.identityMasters.find(
+    (master) => master.id === selectedItem.identityMasterId,
+  ) ?? null;
+  const canGenerateAssetCard = Boolean(
+    selectedItem
+    && (
+      selectedItem.kind !== "character"
+      || selectedIsCollective
+      || selectedItem.referenceImages.length === 0
+    ),
+  );
   const dirty = Boolean(library && editableLibrarySignature(library) !== savedSignature);
   const activeStandard = library?.standard ?? DEFAULT_ASSET_STANDARD;
   const selectedStandard = VISUAL_STANDARD_OPTIONS.find(
@@ -226,6 +318,11 @@ export function AssetWorkspace({
       item.status === "confirmed"
       && itemReady(item)
       && promptUsesCurrentStandard(item, activeStandard)
+      && !(
+        item.kind === "character"
+        && !isCollectiveCharacter(item.kind, item.name)
+        && item.referenceImages.length > 0
+      )
     )) ?? [],
     [activeStandard, library],
   );
@@ -413,6 +510,10 @@ export function AssetWorkspace({
       setError("请先确认资产文字规范再生成参考图");
       return;
     }
+    if (!canGenerateAssetCard) {
+      setError("单人角色只生成一张初始资产卡，后续请从身份母版生成剧情状态图");
+      return;
+    }
     setGeneratingId(selectedItem.id);
     setError(null);
     try {
@@ -424,6 +525,58 @@ export function AssetWorkspace({
       setPreviewImageId(updatedItem?.referenceImages[updatedItem.referenceImages.length - 1]?.id ?? null);
     } catch (generationError) {
       setError(generationError instanceof Error ? generationError.message : "参考图生成失败");
+    } finally {
+      setGeneratingId(null);
+    }
+  };
+
+  const handleCreateIdentityMaster = async () => {
+    if (!project || !selectedItem || !previewImage || selectedIsCollective) return;
+    setBuildingIdentityMaster(true);
+    setError(null);
+    try {
+      const imageData = await cropIdentityPortrait(previewImage.url);
+      const result = await createAssetIdentityMaster(
+        project.id,
+        selectedItem.id,
+        previewImage.id,
+        imageData,
+      );
+      setLibrary(result);
+      setSavedSignature(editableLibrarySignature(result));
+      setBatchPlan((current) => current ? { ...current, current: false } : current);
+      await onAssetsReady();
+    } catch (identityError) {
+      setError(identityError instanceof Error ? identityError.message : "身份母版创建失败");
+    } finally {
+      setBuildingIdentityMaster(false);
+    }
+  };
+
+  const handleGenerateState = async () => {
+    if (!project || !selectedItem || !identityMaster) return;
+    if (!stateLabel.trim() || !statePrompt.trim()) {
+      setError("请填写剧情状态名称和状态描述");
+      return;
+    }
+    setGeneratingId(selectedItem.id);
+    setError(null);
+    try {
+      const result = await generateAssetReferenceImage(project.id, selectedItem.id, {
+        mode: "state",
+        stateLabel: stateLabel.trim(),
+        statePrompt: statePrompt.trim(),
+      });
+      setLibrary(result);
+      setSavedSignature(editableLibrarySignature(result));
+      setBatchPlan((current) => current ? { ...current, current: false } : current);
+      const updatedItem = result.items.find((item) => item.id === selectedItem.id);
+      setPreviewImageId(updatedItem?.referenceImages.at(-1)?.id ?? null);
+      setStateLabel("");
+      setStatePrompt("");
+      await onAssetsReady();
+    } catch (generationError) {
+      setError(generationError instanceof Error ? generationError.message : "剧情状态图生成失败");
     } finally {
       setGeneratingId(null);
     }
@@ -805,11 +958,17 @@ export function AssetWorkspace({
                     <div className="asset-image-placeholder"><ImageOff size={24} /></div>
                   )}
                   <div className="asset-generation-copy">
-                    <strong>{previewImage ? `参考图版本 V${previewVersion}` : "参考图尚未生成"}</strong>
+                    <strong>{previewImage
+                      ? previewImage.role === "state"
+                        ? `剧情状态 · ${previewImage.stateLabel}`
+                        : `资产卡版本 V${previewVersion}`
+                      : "参考图尚未生成"}</strong>
                     {previewImage ? (
                       <p>
                         {selectedItem.referenceImages.length} 个版本 · {previewImage.aspectRatio} · {previewImage.resolution}
-                        {previewImage.identityReferenceImageId ? " · 人脸参考 V1" : ""}
+                        {selectedItem.identityMasters.some(
+                          (master) => master.id === previewImage.identityReferenceImageId,
+                        ) ? " · 继承身份母版" : ""}
                         {previewImage.cost === null ? "" : ` · 费用记录 ${previewImage.cost}`}
                       </p>
                     ) : (
@@ -818,7 +977,15 @@ export function AssetWorkspace({
                         : "确认文字规范并保存后，可调用 TT Image 2.5 生成第一版参考图。"}</p>
                     )}
                     {!selectedIsCollective && selectedItem.referenceImages.length ? (
-                      <p>身份硬控：后续版本始终以 V1 的脸和骨相为准，只更换服装、配饰、发型与状态。</p>
+                      <p>{identityMaster
+                        ? "身份链已锁定：所有后续剧情状态图只继承这张单人正脸母版。"
+                        : "身份链未建立：整张资产卡包含多张脸，不能继续作为身份参考。请先从当前版本建立正脸母版。"}</p>
+                    ) : null}
+                    {identityMaster ? (
+                      <div className="asset-identity-master">
+                        <img src={identityMaster.url} alt={`${selectedItem.name}身份母版`} />
+                        <span><b>当前身份母版</b><small>来源 V{selectedItem.referenceImages.findIndex((image) => image.id === identityMaster.sourceImageId) + 1} · 单张正脸</small></span>
+                      </div>
                     ) : null}
                     {selectedItem.referenceImages.length ? (
                       <div className="asset-version-history" aria-label="参考图历史版本">
@@ -846,6 +1013,18 @@ export function AssetWorkspace({
                     ) : null}
                   </div>
                   <div className="asset-generation-actions">
+                    {!selectedIsCollective && previewImage ? (
+                      <button
+                        className="button secondary compact"
+                        type="button"
+                        disabled={dirty || buildingIdentityMaster || Boolean(generatingId)}
+                        onClick={() => void handleCreateIdentityMaster()}
+                        title="只在本机裁切当前版本左上正脸，不调用模型、不消耗额度"
+                      >
+                        {buildingIdentityMaster ? <LoaderCircle className="spinning" size={15} /> : <ShieldCheck size={15} />}
+                        {buildingIdentityMaster ? "正在建立…" : identityMaster ? "重建身份母版" : "建立身份母版"}
+                      </button>
+                    ) : null}
                     {previewImage && previewImage.id !== primaryImage?.id ? (
                       <button
                         className="button secondary compact"
@@ -857,7 +1036,9 @@ export function AssetWorkspace({
                         {settingPrimary ? "正在设置…" : "设为主参考图"}
                       </button>
                     ) : null}
-                    {!imageModelConfigured ? (
+                    {!canGenerateAssetCard ? (
+                      <small>单人角色资产卡只生成一次；后续统一走下方剧情状态图，避免重新选角。</small>
+                    ) : !imageModelConfigured ? (
                       <button className="button secondary compact" type="button" onClick={onOpenApiSettings}>
                         <ImageIcon size={15} /> 配置图像模型
                       </button>
@@ -886,6 +1067,42 @@ export function AssetWorkspace({
                     {generatingId === selectedItem.id ? <small>通常需要 20 秒—2 分钟，请勿重复点击</small> : null}
                   </div>
                 </footer>
+                {!selectedIsCollective && identityMaster ? (
+                  <section className="asset-state-builder" aria-label="剧情状态图生成">
+                    <div>
+                      <strong>从身份母版生成单张剧情状态图</strong>
+                      <p>只继承同一张脸，不再重新生成四宫格资产卡。状态图用于具体镜头的服装、发型、伤势和情绪。</p>
+                    </div>
+                    <label>
+                      <span>状态名称</span>
+                      <input
+                        value={stateLabel}
+                        maxLength={80}
+                        placeholder="例如：寝衣重生状态"
+                        onChange={(event) => setStateLabel(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>只描述需要变化的状态</span>
+                      <textarea
+                        value={statePrompt}
+                        maxLength={4000}
+                        placeholder="例如：素白寝衣、长发凌乱、病后虚弱，眼神从惊愕转为冷冽，完整全身像"
+                        onChange={(event) => setStatePrompt(event.target.value)}
+                      />
+                    </label>
+                    <button
+                      className="button primary compact"
+                      type="button"
+                      disabled={!imageModelConfigured || Boolean(generatingId) || dirty || !stateLabel.trim() || !statePrompt.trim()}
+                      onClick={() => void handleGenerateState()}
+                      title={!imageModelConfigured ? "请先配置图像模型" : "本操作会消耗一次生图额度"}
+                    >
+                      {generatingId === selectedItem.id ? <LoaderCircle className="spinning" size={15} /> : <Sparkles size={15} />}
+                      {generatingId === selectedItem.id ? "正在生成…" : "生成状态图（消耗额度）"}
+                    </button>
+                  </section>
+                ) : null}
                 {promptPreview?.assetId === selectedItem.id ? (
                   <div
                     className="asset-prompt-preview"
@@ -945,8 +1162,8 @@ export function AssetWorkspace({
                     <div className="asset-image-lightbox-panel" onClick={(event) => event.stopPropagation()}>
                       <header>
                         <div>
-                          <strong>{selectedItem.name} · 版本 V{previewVersion}</strong>
-                          <span>{previewImage.aspectRatio} · {previewImage.resolution}{previewImage.id === primaryImage?.id ? " · 主参考图" : ""}</span>
+                          <strong>{selectedItem.name} · {previewImage.role === "state" ? previewImage.stateLabel : `资产卡 V${previewVersion}`}</strong>
+                          <span>{previewImage.aspectRatio} · {previewImage.resolution} · {previewImage.role === "state" ? "剧情状态图" : "资产卡"}{previewImage.id === primaryImage?.id ? " · 主参考图" : ""}</span>
                         </div>
                         <button type="button" aria-label="关闭大图预览" onClick={() => setLightboxOpen(false)} autoFocus>
                           <X size={20} />
@@ -1018,7 +1235,12 @@ export function AssetWorkspace({
                       {library.items.map((item) => {
                         const eligible = item.status === "confirmed"
                           && itemReady(item)
-                          && promptUsesCurrentStandard(item, activeStandard);
+                          && promptUsesCurrentStandard(item, activeStandard)
+                          && !(
+                            item.kind === "character"
+                            && !isCollectiveCharacter(item.kind, item.name)
+                            && item.referenceImages.length > 0
+                          );
                         const selected = batchSelectedIds.includes(item.id);
                         const reviewed = reviewedSet.has(item.id);
                         return (

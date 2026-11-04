@@ -356,6 +356,8 @@ export function VideoWorkspace({
                             url: reference.imageUrl,
                             label: "当前主图",
                             identityReferenceImageId: "",
+                            identityMasterId: "",
+                            identityMasterUrl: "",
                           };
                           return (
                             <div key={reference.assetId}>

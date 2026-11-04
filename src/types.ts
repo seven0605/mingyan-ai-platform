@@ -288,6 +288,15 @@ export interface AssetImageVersion {
   resolution: string;
   cost: number | null;
   identityReferenceImageId: string;
+  role: "asset-card" | "state";
+  stateLabel: string;
+  createdAt: string;
+}
+
+export interface AssetIdentityMaster {
+  id: string;
+  url: string;
+  sourceImageId: string;
   createdAt: string;
 }
 
@@ -305,6 +314,8 @@ export interface AssetItem {
   promptStandardSignature: string;
   referenceImages: AssetImageVersion[];
   primaryReferenceImageId: string | null;
+  identityMasters: AssetIdentityMaster[];
+  identityMasterId: string | null;
 }
 
 export interface AssetLibrary {
@@ -349,7 +360,11 @@ export interface VideoPlanAssetReference {
     url: string;
     label: string;
     identityReferenceImageId: string;
+    identityMasterId: string;
+    identityMasterUrl: string;
   }>;
+  identityMasterId: string;
+  identityMasterUrl: string;
 }
 
 export interface VideoProductionPlanItem {
