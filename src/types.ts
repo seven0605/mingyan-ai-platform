@@ -277,6 +277,7 @@ export interface AssetImageVersion {
   aspectRatio: string;
   resolution: string;
   cost: number | null;
+  identityReferenceImageId: string;
   createdAt: string;
 }
 

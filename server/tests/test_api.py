@@ -5,7 +5,7 @@ import sqlite3
 import httpx
 from fastapi.testclient import TestClient
 
-from server.app import create_app
+from server.app import asset_aspect_ratio, create_app, is_collective_character
 
 
 class MemoryCredentialStore:
@@ -19,11 +19,20 @@ class MemoryCredentialStore:
         self.values[name] = value
 
 
+def test_collective_characters_use_widescreen() -> None:
+    assert is_collective_character("character", "萧府护卫们") is True
+    assert is_collective_character("character", "暗影卫众") is True
+    assert is_collective_character("character", "云子姝") is False
+    assert asset_aspect_ratio("live-action", "character", "萧府护卫们") == "16:9"
+    assert asset_aspect_ratio("live-action", "character", "云子姝") == "9:16"
+
+
 def test_project_lifecycle_persists(tmp_path: Path) -> None:
     credentials = MemoryCredentialStore()
     invalid_screenplay = False
     invalid_storyboard = False
     image_generation_failed = False
+    image_requests: list[dict] = []
 
     script_plan_payload = {
         "title": "凤掌九天",
@@ -214,10 +223,18 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         if request.url.path == "/v1/media/generate":
             assert request.headers["Authorization"] == "Bearer image-secret-not-for-sqlite"
             request_payload = json.loads(request.content)
+            image_requests.append(request_payload)
             assert request_payload["model"] == "tt-image-2.5"
             assert "云子姝" in request_payload["prompt"]
             assert request_payload["params"]["aspect_ratio"] == "9:16"
             assert request_payload["params"]["resolution"] == "1K"
+            if len(image_requests) == 1:
+                assert "images" not in request_payload["params"]
+            else:
+                assert request_payload["params"]["images"][0].startswith(
+                    "data:image/png;base64,"
+                )
+                assert "V1身份参考硬锁" in request_payload["prompt"]
             return httpx.Response(
                 200,
                 json={"code": 200, "data": {"task_id": "image-task-1"}},
@@ -659,7 +676,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         )
         yun_zishu["referencePrompt"] = "【角色资产卡｜云子姝】按手绘3渲2固定四宫格规则生成"
         yun_zishu["promptStandardSignature"] = (
-            "handpainted-3d2d|ming|2026-11-04.6"
+            "handpainted-3d2d|ming|2026-11-04.8"
         )
         original_prompt = yun_zishu["referencePrompt"]
         yun_zishu["visualAnchor"] = "冷白肤色、素白中衣、长发凌乱、目光冷厉"
@@ -715,6 +732,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert generated_image["aspectRatio"] == "9:16"
         assert generated_image["resolution"] == "1K"
         assert generated_image["cost"] == 0.23
+        assert generated_image["identityReferenceImageId"] == ""
         assert generated_yun_zishu["primaryReferenceImageId"] == generated_image["id"]
         generated_tasks = client.get(f"/api/projects/{project['id']}/tasks")
         assert generated_tasks.status_code == 200
@@ -785,6 +803,8 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             f"/api/projects/{project['id']}/assets/batch-plan"
         ).json()["current"] is False
         second_image = second_yun_zishu["referenceImages"][1]
+        assert second_image["identityReferenceImageId"] == generated_image["id"]
+        assert "V1身份参考硬锁" in second_image["prompt"]
         assert len(client.get(f"/api/projects/{project['id']}/tasks").json()) == 2
         missing_primary = client.put(
             f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images/00000000-0000-4000-8000-000000000000/primary"
@@ -961,7 +981,7 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
                 "name": "角色甲",
                 "status": "confirmed",
                 "referencePrompt": "角色甲完整提示词",
-                "promptStandardSignature": "live-action|auto|2026-11-04.6",
+                "promptStandardSignature": "live-action|auto|2026-11-04.8",
             },
             {
                 "id": second_asset_id,
@@ -969,7 +989,7 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
                 "name": "场景乙",
                 "status": "confirmed",
                 "referencePrompt": "场景乙完整提示词",
-                "promptStandardSignature": "live-action|auto|2026-11-04.6",
+                "promptStandardSignature": "live-action|auto|2026-11-04.8",
             },
         ]
         plan = {

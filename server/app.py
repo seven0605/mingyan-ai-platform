@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -336,6 +337,7 @@ class AssetImageVersion(BaseModel):
     aspectRatio: str
     resolution: str
     cost: float | None = None
+    identityReferenceImageId: str = ""
     createdAt: str
 
 
@@ -392,7 +394,7 @@ class AssetStandardSettings(BaseModel):
     ] = "auto"
 
 
-ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.6"
+ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.8"
 
 
 def asset_standard_signature(settings: AssetStandardSettings) -> str:
@@ -402,9 +404,17 @@ def asset_standard_signature(settings: AssetStandardSettings) -> str:
     )
 
 
+def is_collective_character(kind: str, name: str) -> bool:
+    return kind == "character" and bool(
+        re.search(r"(?:们|众人|卫众|护卫们|婆子侍女)$", name.strip())
+    )
+
+
 def asset_aspect_ratio(
-    standard: str, kind: Literal["character", "scene", "prop"]
+    standard: str, kind: Literal["character", "scene", "prop"], name: str = ""
 ) -> str:
+    if is_collective_character(kind, name):
+        return "16:9"
     if standard == "western-dark-medieval":
         return "16:9"
     if standard in {"victorian-gothic", "guofeng-3d"}:
@@ -802,16 +812,21 @@ def validate_asset_library(payload: AssetLibraryPayload) -> None:
             UUID(item.id)
         except ValueError as error:
             raise ValueError("资产编号格式无效") from error
-        if item.status == "confirmed" and any(
-            not value.strip()
-            for value in (
-                item.description,
-                item.visualAnchor,
-                item.continuityNotes,
-                item.referencePrompt,
+        if item.status == "confirmed":
+            required_values = (
+                (item.referencePrompt,)
+                if is_collective_character(item.kind, item.name)
+                else (
+                    item.description,
+                    item.visualAnchor,
+                    item.continuityNotes,
+                    item.referencePrompt,
+                )
             )
-        ):
-            raise ValueError(f"{item.name} 尚未补全说明、视觉锚点、连续性或生图提示词")
+            if any(not value.strip() for value in required_values):
+                raise ValueError(
+                    f"{item.name} 尚未补全说明、视觉锚点、连续性或生图提示词"
+                )
 
 
 def build_asset_library(
@@ -1326,6 +1341,59 @@ def create_app(
             raise HTTPException(status_code=409, detail="系统凭据库中没有找到图像 API 密钥")
         return settings, api_key
 
+    def identity_reference_for_asset(
+        project_id: str, asset: AssetItem
+    ) -> tuple[str, str]:
+        if (
+            asset.kind != "character"
+            or is_collective_character(asset.kind, asset.name)
+            or not asset.referenceImages
+        ):
+            return "", ""
+        reference = asset.referenceImages[0]
+        image_dir = resolved_data_dir / "generated" / project_id / asset.id
+        suffix_mime = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }
+        for suffix, mime_type in suffix_mime.items():
+            image_path = image_dir / f"{reference.id}{suffix}"
+            if not image_path.is_file():
+                continue
+            image_bytes = image_path.read_bytes()
+            if not image_bytes or len(image_bytes) > 10 * 1024 * 1024:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{asset.name} 的 V1 人脸参考图为空或超过 10MB",
+                )
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            return f"data:{mime_type};base64,{encoded}", reference.id
+        raise HTTPException(
+            status_code=409,
+            detail=f"{asset.name} 的 V1 人脸参考图文件缺失，无法执行身份硬控",
+        )
+
+    def generation_request_for_asset(
+        project_id: str, asset: AssetItem, base_prompt: str
+    ) -> tuple[str, dict[str, list[str]], str]:
+        reference_data_uri, reference_id = identity_reference_for_asset(
+            project_id, asset
+        )
+        if not reference_id:
+            return base_prompt, {}, ""
+        identity_lock = (
+            "【V1身份参考硬锁｜最高优先级】以随请求附带的V1参考图中的人物面部作为唯一身份基准。"
+            "必须保留同一张脸、骨相、五官比例、年龄、肤色和身体比例；只允许按照本次提示更换服装、"
+            "配饰、发型、妆容与剧情状态。禁止重新选角，禁止生成相似但不同的人，禁止让文字描述覆盖V1面部身份。"
+        )
+        return (
+            f"{identity_lock}\n\n{base_prompt}",
+            {"images": [reference_data_uri]},
+            reference_id,
+        )
+
     def process_generation_job(job_id: str) -> None:
         with connect(database_path) as connection:
             job = connection.execute(
@@ -1338,6 +1406,27 @@ def create_app(
         recoverable = bool(provider_task_id)
         image_path: Path | None = None
         try:
+            with connect(database_path) as connection:
+                asset_row = connection.execute(
+                    "SELECT * FROM project_assets WHERE project_id = ?",
+                    (job["project_id"],),
+                ).fetchone()
+            if asset_row is None:
+                raise HTTPException(status_code=404, detail="资产库不存在")
+            job_library = AssetLibraryPayload.model_validate(
+                json.loads(asset_row["payload"])
+            )
+            job_asset = next(
+                (item for item in job_library.items if item.id == job["asset_id"]),
+                None,
+            )
+            if job_asset is None:
+                raise HTTPException(status_code=404, detail="资产不存在")
+            request_prompt, reference_params, identity_reference_id = (
+                generation_request_for_asset(
+                    job["project_id"], job_asset, job["prompt"]
+                )
+            )
             settings, api_key = image_model_credentials()
             api_root = settings.baseUrl if settings.baseUrl.endswith("/v1") else f"{settings.baseUrl}/v1"
             headers = {"Authorization": f"Bearer {api_key}"}
@@ -1351,13 +1440,14 @@ def create_app(
                         headers=headers,
                         json={
                             "model": job["model"],
-                            "prompt": job["prompt"],
+                            "prompt": request_prompt,
                             "params": {
                                 "version": "flare",
                                 "aspect_ratio": job["aspect_ratio"],
                                 "resolution": "1K",
                                 "quality": "auto",
                                 "background": "opaque",
+                                **reference_params,
                             },
                         },
                     )
@@ -1454,12 +1544,13 @@ def create_app(
             image = AssetImageVersion(
                 id=job_id,
                 url=f"/api/projects/{job['project_id']}/assets/{job['asset_id']}/images/{job_id}",
-                prompt=job["prompt"],
+                prompt=request_prompt,
                 model=job["model"],
                 taskId=provider_task_id,
                 aspectRatio=job["aspect_ratio"],
                 resolution="1K",
                 cost=cost,
+                identityReferenceImageId=identity_reference_id,
                 createdAt=now,
             )
             with connect(database_path) as connection:
@@ -2830,7 +2921,7 @@ def create_app(
                     name=item.name,
                     prompt=item.referencePrompt,
                     aspectRatio=asset_aspect_ratio(
-                        library.standard.visualStandard, item.kind
+                        library.standard.visualStandard, item.kind, item.name
                     ),
                     existingVersionCount=len(item.referenceImages),
                 )
@@ -3237,7 +3328,12 @@ def create_app(
             )
 
         settings, api_key = image_model_credentials()
-        aspect_ratio = asset_aspect_ratio(library.standard.visualStandard, asset.kind)
+        aspect_ratio = asset_aspect_ratio(
+            library.standard.visualStandard, asset.kind, asset.name
+        )
+        request_prompt, reference_params, identity_reference_id = (
+            generation_request_for_asset(project_id, asset, asset.referencePrompt)
+        )
         api_root = settings.baseUrl if settings.baseUrl.endswith("/v1") else f"{settings.baseUrl}/v1"
         headers = {"Authorization": f"Bearer {api_key}"}
         task_id = ""
@@ -3251,13 +3347,14 @@ def create_app(
                     headers=headers,
                     json={
                         "model": settings.model,
-                        "prompt": asset.referencePrompt,
+                        "prompt": request_prompt,
                         "params": {
                             "version": "flare",
                             "aspect_ratio": aspect_ratio,
                             "resolution": "1K",
                             "quality": "auto",
                             "background": "opaque",
+                            **reference_params,
                         },
                     },
                 )
@@ -3339,12 +3436,13 @@ def create_app(
         image = AssetImageVersion(
             id=image_id,
             url=f"/api/projects/{project_id}/assets/{asset_id}/images/{image_id}",
-            prompt=asset.referencePrompt,
+            prompt=request_prompt,
             model=settings.model,
             taskId=task_id,
             aspectRatio=aspect_ratio,
             resolution="1K",
             cost=cost,
+            identityReferenceImageId=identity_reference_id,
             createdAt=now,
         )
         updated_library = library.model_copy(

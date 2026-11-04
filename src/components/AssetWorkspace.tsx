@@ -39,6 +39,7 @@ import {
   assetStandardSignature,
   COSTUME_ERA_OPTIONS,
   DEFAULT_ASSET_STANDARD,
+  isCollectiveCharacter,
   VISUAL_STANDARD_OPTIONS,
 } from "../lib/assetStandards";
 import {
@@ -81,6 +82,9 @@ function latestStoryboardTime(storyboards: Storyboard[]) {
 }
 
 function itemReady(item: AssetItem) {
+  if (isCollectiveCharacter(item.kind, item.name)) {
+    return Boolean(item.referencePrompt.trim());
+  }
   return Boolean(
     item.description.trim()
     && item.visualAnchor.trim()
@@ -201,6 +205,9 @@ export function AssetWorkspace({
   const previewVersion = previewImage
     ? (selectedItem?.referenceImages.findIndex((image) => image.id === previewImage.id) ?? -1) + 1
     : 0;
+  const selectedIsCollective = selectedItem
+    ? isCollectiveCharacter(selectedItem.kind, selectedItem.name)
+    : false;
   const dirty = Boolean(library && editableLibrarySignature(library) !== savedSignature);
   const activeStandard = library?.standard ?? DEFAULT_ASSET_STANDARD;
   const selectedStandard = VISUAL_STANDARD_OPTIONS.find(
@@ -802,11 +809,17 @@ export function AssetWorkspace({
                     {previewImage ? (
                       <p>
                         {selectedItem.referenceImages.length} 个版本 · {previewImage.aspectRatio} · {previewImage.resolution}
+                        {previewImage.identityReferenceImageId ? " · 人脸参考 V1" : ""}
                         {previewImage.cost === null ? "" : ` · 费用记录 ${previewImage.cost}`}
                       </p>
                     ) : (
-                      <p>确认文字规范并保存后，可调用 TT Image 2.5 生成第一版参考图。</p>
+                      <p>{selectedIsCollective
+                        ? "群演模式将生成一张 16:9 全身群像，不套用单人资产卡。"
+                        : "确认文字规范并保存后，可调用 TT Image 2.5 生成第一版参考图。"}</p>
                     )}
+                    {!selectedIsCollective && selectedItem.referenceImages.length ? (
+                      <p>身份硬控：后续版本始终以 V1 的脸和骨相为准，只更换服装、配饰、发型与状态。</p>
+                    ) : null}
                     {selectedItem.referenceImages.length ? (
                       <div className="asset-version-history" aria-label="参考图历史版本">
                         {selectedItem.referenceImages.map((image, index) => {
@@ -1042,7 +1055,7 @@ export function AssetWorkspace({
                         <header>
                           <div>
                             <strong>{batchReviewItem.name}</strong>
-                            <span>{KIND_META[batchReviewItem.kind].label}资产 · {assetAspectRatio(activeStandard.visualStandard, batchReviewItem.kind)} · 1K</span>
+                            <span>{KIND_META[batchReviewItem.kind].label}资产 · {assetAspectRatio(activeStandard.visualStandard, batchReviewItem.kind, batchReviewItem.name)} · 1K</span>
                           </div>
                           <span className={reviewedSet.has(batchReviewItem.id) ? "reviewed" : ""}>
                             {reviewedSet.has(batchReviewItem.id) ? "已完成审查" : "等待审查"}

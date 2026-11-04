@@ -24,7 +24,11 @@ export const DEFAULT_ASSET_STANDARD: AssetStandardSettings = {
   costumeEra: "auto",
 };
 
-export const ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.6";
+export const ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.8";
+
+export function isCollectiveCharacter(kind: "character" | "scene" | "prop", name: string) {
+  return kind === "character" && /(?:们|众人|卫众|护卫们|婆子侍女)$/.test(name.trim());
+}
 
 export function assetStandardSignature(settings: AssetStandardSettings) {
   return `${settings.visualStandard}|${settings.costumeEra}|${ASSET_PROMPT_TEMPLATE_VERSION}`;
@@ -33,7 +37,9 @@ export function assetStandardSignature(settings: AssetStandardSettings) {
 export function assetAspectRatio(
   standard: AssetVisualStandard,
   kind: "character" | "scene" | "prop",
+  name = "",
 ) {
+  if (isCollectiveCharacter(kind, name)) return "16:9";
   if (standard === "western-dark-medieval") return "16:9";
   if (standard === "victorian-gothic") return kind === "character" ? "9:16" : "16:9";
   if (standard === "guofeng-3d") return kind === "character" ? "9:16" : "16:9";

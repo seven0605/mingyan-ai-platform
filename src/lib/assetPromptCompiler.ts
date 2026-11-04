@@ -5,7 +5,11 @@ import type {
   AssetVisualStandard,
   CostumeEra,
 } from "../types";
-import { COSTUME_ERA_OPTIONS, VISUAL_STANDARD_OPTIONS } from "./assetStandards";
+import {
+  COSTUME_ERA_OPTIONS,
+  isCollectiveCharacter,
+  VISUAL_STANDARD_OPTIONS,
+} from "./assetStandards";
 
 export interface CompiledAssetPrompt {
   prompt: string;
@@ -194,6 +198,103 @@ const DETAILED_ERA_RULES: Partial<Record<CostumeEra, string>> = {
 
 const MING_FEMALE_RULE = "明代女性服饰：按身份与场合选择直领大襟（交领）短袄或对襟衫袄，下配马面裙；可按身份罩方领对襟比甲。皇室与高等级女性可使用暗花、织金或妆花丝织物，侍女与平民降低纹样密度、材质与饱和度。发式盘髻并按身份配置簪钗；凤冠、霞帔等礼服组件只在符合身份的正式礼仪场合使用，日常造型不得滥用。禁止清代旗装、马蹄袖、晚清多重滚边、西式束腰与现代影楼古装。";
 
+const GROUP_STYLE: Record<AssetVisualStandard, string> = {
+  "live-action": "真人写实电影选角照，真实中国演员，真实皮肤、发丝、布料纤维与自然体型，克制的影视棚拍光线",
+  "guofeng-3d": "高品质国风3D动画群像，统一的电影级PBR材质、皮肤SSS与中华传统审美，拒绝塑料玩具感",
+  "handpainted-3d2d": "手绘3渲2群像，统一的分块明暗、手绘纹理、选择性描边与非照片级造型语言",
+  "western-dark-medieval": "西方暗黑中世纪真人电影群像，真实演员、做旧材质、冷峻低饱和实拍质感",
+  "victorian-gothic": "维多利亚时代暗黑真人电影群像，真实演员、符合年代的剪裁与材料、克制哥特氛围",
+};
+
+function collectiveProfile(name: string) {
+  if (name.endsWith("萧府护卫们")) {
+    return {
+      count: "6—8人",
+      gender: "全部为男性：6—8名成年男性，女性0人",
+      identity: "20—45岁的明代武将府邸家兵与护卫，身高、年龄、体型、脸型、肤色与风霜程度各不相同",
+      wardrobe: "深青、墨黑、灰褐等低饱和窄袖袍服、护腕、皮革腰带与便于行动的靴履；每人的层次、旧化、束带、护腕和小配件不同，但同属萧府体系；兵器收鞘，不遮挡全身",
+    };
+  }
+  if (name.endsWith("萧府婆子侍女")) {
+    return {
+      count: "6—8人",
+      gender: "全部为女性：2—3名中老年婆子，加4—5名年轻侍女，男性0人",
+      identity: "明代将军府内宅仆役，年龄、身高、体型、脸型、肤色与神态各异，婆子稳重老练，侍女年轻利落",
+      wardrobe: "婆子与侍女分别穿符合身份的明代衫袄、比甲与马面裙，材质朴素、纹样克制；颜色、领型、袖口、腰间小物与发髻各异，但保持同一府邸的服装体系",
+    };
+  }
+  if (name.endsWith("暗影卫众")) {
+    return {
+      count: "6—8人",
+      gender: "全部为男性：6—8名成年男性，女性0人",
+      identity: "训练有素的明代秘密护卫，年龄、身高、体型与脸型各异，神情警觉克制，不得复制同一张脸",
+      wardrobe: "黑、炭灰、深靛色的明代行动装束，窄袖、护腕、束带、软靴与少量功能配件各不相同；统一隐秘职能但绝非整齐复制的制服克隆人",
+    };
+  }
+  if (name === "众人" || name.endsWith("众人")) {
+    return {
+      count: "8—10人",
+      gender: "男性4—5人、女性4—5人，男女总数必须为8—10人",
+      identity: "明代宅邸或庭院中的背景群演，覆盖青年、中年和少量年长者，身份层级、身高、体型、脸型与神态各不相同",
+      wardrobe: "按男女与身份分别穿明代日常服饰，材料、颜色、旧化程度、发式和小配件各异；不得出现清代旗装、马蹄袖或现代影楼古装",
+    };
+  }
+  return {
+    count: "6—8人",
+    gender: "男性3—4人、女性3—4人，男女总数必须为6—8人",
+    identity: "同一时代与职能下的背景群演，年龄、身高、体型、脸型、肤色、发型和神态各不相同",
+    wardrobe: "服装款式、颜色、材质、旧化、配饰与发式各异，但保持同一时代、阶层与制作画风",
+  };
+}
+
+function compileCollectivePrompt(
+  item: AssetItem,
+  settings: AssetStandardSettings,
+  standardLabel: string,
+): CompiledAssetPrompt {
+  const profile = collectiveProfile(item.name);
+  const era = COSTUME_ERA_OPTIONS.find((option) => option.id === settings.costumeEra)
+    ?? COSTUME_ERA_OPTIONS[0];
+  const compatibleWithChineseCostume = VISUAL_STANDARD_OPTIONS.find(
+    (option) => option.id === settings.visualStandard,
+  )?.compatibleWithChineseCostume;
+  const mingCostumeRule = profile.gender.includes("女性0人")
+    ? "男性束发并按身份使用网巾或合适巾帽，服装材料、纹样与配饰服从其职能和身份。"
+    : profile.gender.includes("男性0人")
+      ? "女性使用明代盘髻、衫袄、比甲与马面裙体系，服装材料、纹样与配饰服从其职能和身份。"
+      : "男性束发并按身份使用网巾或合适巾帽；女性使用明代盘髻、衫袄、比甲与马面裙体系；所有人的材料、纹样与配饰服从身份。";
+  const eraRule = compatibleWithChineseCostume && settings.costumeEra === "ming"
+    ? `时代严格锁定明代。${mingCostumeRule}禁止清代旗装、马蹄袖、晚清滚边、西式束腰和现代影楼古装。`
+    : compatibleWithChineseCostume && settings.costumeEra !== "auto"
+      ? `时代严格锁定${era.label}代，所有男女服饰、发式、材料与配饰必须符合该朝代和身份，不混入其他时代标志。`
+      : compatibleWithChineseCostume
+        ? "中国朝代尚未确定，不擅自添加具有明确朝代归属的冠帽、剪裁和配饰。"
+        : null;
+  const prompt = [
+    `【群演形象｜${item.name}】`,
+    "生成一张单独的16:9横版群演形象图，不使用资产卡、四宫格、多视图、表格、标签或文字。",
+    `【画风】${GROUP_STYLE[settings.visualStandard]}。`,
+    `【人数】画面中严格为${profile.count}。`,
+    `【性别分配】${profile.gender}。`,
+    `【身份与外貌】${profile.identity}。每个人必须是独立选角：五官、骨相、年龄感、发际线、发型、身高与体型明显不同；禁止复制脸、双胞胎感和同一模型批量换装。`,
+    `【服饰】${profile.wardrobe}。服装必须各异但属于同一世界观，禁止整齐复制同一套衣服。`,
+    eraRule ? `【时代硬锁】${eraRule}` : null,
+    item.description.trim() ? `【剧本身份补充】${item.description.trim()}` : null,
+    item.visualAnchor.trim() ? `【视觉补充】${item.visualAnchor.trim()}` : null,
+    item.continuityNotes.trim() ? `【连续性补充】${item.continuityNotes.trim()}` : null,
+    "【构图硬锁】所有人从头到脚完整入镜，双脚清晰可见，站姿自然，横向错落排布并留有可分割间距；人物之间不得大面积遮挡，不得裁头、裁脚，不得把任何人放进单独格子。纯净中性影棚背景，统一光向、曝光、镜头高度与画风。",
+    "【禁止】禁止单人、人数不足或超出范围、同脸克隆、复制粘贴、相同服装、拥挤遮挡、半身像、裁切脚部、角色资产卡、四宫格、九宫格、多视图、场景叙事、战斗动作、文字、姓名、编号、Logo和水印。",
+  ].filter((section): section is string => Boolean(section)).join("\n\n");
+  return {
+    prompt,
+    warnings: compatibleWithChineseCostume && settings.costumeEra === "auto"
+      ? ["尚未指定中国朝代，正式生成前需要人工确认年代。"]
+      : [],
+    standardLabel,
+    eraLabel: compatibleWithChineseCostume ? era.label : null,
+  };
+}
+
 function sourceLine(label: string, value: string) {
   return `${label}：${value.trim() || "待补充"}`;
 }
@@ -308,6 +409,9 @@ function costumeLayer(item: AssetItem, settings: AssetStandardSettings) {
 export function compileAssetPrompt(item: AssetItem, settings: AssetStandardSettings): CompiledAssetPrompt {
   const standard = VISUAL_STANDARD_OPTIONS.find((option) => option.id === settings.visualStandard)
     ?? VISUAL_STANDARD_OPTIONS[0];
+  if (isCollectiveCharacter(item.kind, item.name)) {
+    return compileCollectivePrompt(item, settings, standard.label);
+  }
   const costume = costumeLayer(item, settings);
   const template = TEMPLATE_BY_STANDARD[settings.visualStandard][item.kind]
     .replaceAll("【场景名称】", `【${item.name}】`);
