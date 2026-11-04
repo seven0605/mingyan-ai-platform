@@ -5,7 +5,14 @@ import sqlite3
 import httpx
 from fastapi.testclient import TestClient
 
-from server.app import asset_aspect_ratio, create_app, is_collective_character
+from server.app import (
+    VideoProductionPlanItem,
+    asset_aspect_ratio,
+    build_video_batch_prompt,
+    create_app,
+    is_collective_character,
+    pack_video_plan_items,
+)
 from server.asset_tunnel import AssetTunnelStatus, TemporaryAssetTunnel
 
 
@@ -63,6 +70,35 @@ def test_collective_characters_use_widescreen() -> None:
     assert is_collective_character("character", "云子姝") is False
     assert asset_aspect_ratio("live-action", "character", "萧府护卫们") == "16:9"
     assert asset_aspect_ratio("live-action", "character", "云子姝") == "9:16"
+
+
+def test_video_plan_items_pack_into_thirty_second_requests() -> None:
+    def item(index: int, duration: int) -> VideoProductionPlanItem:
+        return VideoProductionPlanItem(
+            id=f"e1-g{index}",
+            episodeNumber=1,
+            episodeTitle="测试集",
+            groupIndex=index,
+            sceneIndex=1,
+            durationSeconds=duration,
+            aspectRatio="16:9",
+            targetModel="seedance-2.0",
+            purpose=f"推进第{index}段",
+            prompt=f"第{index}段提示词",
+            assetReferences=[],
+            blockingReasons=[],
+            ready=True,
+        )
+
+    batches = pack_video_plan_items([item(1, 15), item(2, 15), item(3, 15)])
+    assert [[part.id for part in batch] for batch in batches] == [
+        ["e1-g1", "e1-g2"],
+        ["e1-g3"],
+    ]
+    assert len(pack_video_plan_items([item(1, 15), item(3, 15)])) == 2
+    padded_prompt = build_video_batch_prompt([item(1, 15)])
+    assert "【00-15秒｜第1集·镜头组1】" in padded_prompt
+    assert "【15-30秒｜自然收束】" in padded_prompt
 
 
 def test_temporary_asset_gateway_only_serves_whitelisted_files(tmp_path: Path) -> None:
@@ -336,7 +372,9 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             video_requests.append(request_payload)
             assert request_payload["model"] == "BD Seedance2.5"
             assert "【参考图顺序锁定】图1=" in request_payload["prompt"]
-            assert request_payload["seconds"] == "15"
+            assert request_payload["seconds"] == "30"
+            assert "【00-15秒｜第1集·镜头组1】" in request_payload["prompt"]
+            assert "【15-30秒｜第1集·镜头组2】" in request_payload["prompt"]
             assert request_payload["size"] == "1280x720"
             reference_urls = request_payload["metadata"]["__workbench_refs"][
                 "reference_image_urls"
@@ -1038,17 +1076,18 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             f"/api/projects/{project['id']}/video-plan/queue"
         )
         assert queued_videos.status_code == 200
-        assert [task["type"] for task in queued_videos.json()] == ["video", "video"]
-        assert [task["status"] for task in queued_videos.json()] == ["queued", "queued"]
-        assert len(video_requests) == 2
-        assert fake_tunnel.start_count == 2
+        assert [task["type"] for task in queued_videos.json()] == ["video"]
+        assert [task["status"] for task in queued_videos.json()] == ["queued"]
+        assert queued_videos.json()[0]["title"].endswith("镜头组 1–2（30秒）")
+        assert len(video_requests) == 1
+        assert fake_tunnel.start_count == 1
         assert fake_tunnel.running is False
         video_tasks = [
             task
             for task in client.get(f"/api/projects/{project['id']}/tasks").json()
             if task["type"] == "video"
         ]
-        assert len(video_tasks) == 2
+        assert len(video_tasks) == 1
         assert all(task["status"] == "completed" for task in video_tasks)
         assert all(task["providerTaskId"].startswith("video-task-") for task in video_tasks)
         generated_video = client.get(video_tasks[0]["resultUrl"])
@@ -1108,7 +1147,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert restored_yun_zishu["primaryReferenceImageId"] == generated_image["id"]
         assert client.get(restored_yun_zishu["referenceImages"][0]["url"]).status_code == 200
         restored_tasks = client.get(f"/api/projects/{projects[0]['id']}/tasks").json()
-        assert len(restored_tasks) == 5
+        assert len(restored_tasks) == 4
         assert all(task["status"] == "completed" for task in restored_tasks)
         restored_batch_plan = client.get(
             f"/api/projects/{projects[0]['id']}/assets/batch-plan"

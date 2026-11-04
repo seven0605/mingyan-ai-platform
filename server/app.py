@@ -45,6 +45,7 @@ CHAPTER_HEADING = re.compile(
     r"^(?:第[0-9０-９一二三四五六七八九十百千万]{1,16}[章节回卷部]|楔子|序章|番外)\s*$",
     re.MULTILINE,
 )
+VIDEO_REQUEST_SECONDS = 30
 
 
 class ProjectCreate(BaseModel):
@@ -1015,6 +1016,50 @@ def row_to_video_generation_task(row: sqlite3.Row) -> ProjectTaskOut:
 
 def unique_strings(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+def pack_video_plan_items(
+    items: list[VideoProductionPlanItem],
+) -> list[list[VideoProductionPlanItem]]:
+    ordered = sorted(items, key=lambda item: (item.episodeNumber, item.groupIndex))
+    batches: list[list[VideoProductionPlanItem]] = []
+    for item in ordered:
+        current = batches[-1] if batches else []
+        previous = current[-1] if current else None
+        current_seconds = sum(part.durationSeconds for part in current)
+        can_append = bool(
+            previous
+            and item.episodeNumber == previous.episodeNumber
+            and item.groupIndex == previous.groupIndex + 1
+            and item.aspectRatio == previous.aspectRatio
+            and item.targetModel == previous.targetModel
+            and current_seconds + item.durationSeconds <= VIDEO_REQUEST_SECONDS
+        )
+        if can_append:
+            current.append(item)
+        else:
+            batches.append([item])
+    return batches
+
+
+def build_video_batch_prompt(items: list[VideoProductionPlanItem]) -> str:
+    cursor = 0
+    sections = [
+        "生成一条完整30秒连续视频。严格按以下时间轴执行；各段人物身份、服装、场景、站位与动作必须连续，不得重复前段剧情。"
+    ]
+    for item in items:
+        end = cursor + item.durationSeconds
+        sections.append(
+            f"【{cursor:02d}-{end:02d}秒｜第{item.episodeNumber}集·镜头组{item.groupIndex}】\n"
+            f"叙事目的：{item.purpose}\n{item.prompt}"
+        )
+        cursor = end
+    if cursor < VIDEO_REQUEST_SECONDS:
+        sections.append(
+            f"【{cursor:02d}-{VIDEO_REQUEST_SECONDS:02d}秒｜自然收束】\n"
+            "延续最后一个镜头的动作和情绪，让表演、环境声与镜头运动自然收束；不新增人物、事件或台词。"
+        )
+    return "\n\n".join(sections)
 
 
 def validate_asset_library(payload: AssetLibraryPayload) -> None:
@@ -3699,18 +3744,31 @@ def create_app(
             )
 
         batch_id = str(uuid4())
+        video_batches = pack_video_plan_items(selected_items)
         with connect(database_path) as connection:
-            for item in selected_items:
+            for items in video_batches:
                 now = utc_now()
-                references = [
-                    {
-                        "logicalId": f"{reference.assetId}:{reference.imageId}",
-                        "assetId": reference.assetId,
-                        "imageId": reference.imageId,
-                        "name": reference.name,
-                    }
-                    for reference in item.assetReferences
-                ]
+                references_by_id: dict[str, dict[str, str]] = {}
+                for item in items:
+                    for reference in item.assetReferences:
+                        logical_id = f"{reference.assetId}:{reference.imageId}"
+                        references_by_id.setdefault(
+                            logical_id,
+                            {
+                                "logicalId": logical_id,
+                                "assetId": reference.assetId,
+                                "imageId": reference.imageId,
+                                "name": reference.name,
+                            },
+                        )
+                references = list(references_by_id.values())
+                first_item = items[0]
+                last_item = items[-1]
+                group_label = (
+                    str(first_item.groupIndex)
+                    if len(items) == 1
+                    else f"{first_item.groupIndex}–{last_item.groupIndex}"
+                )
                 connection.execute(
                     """
                     INSERT INTO video_generation_jobs (
@@ -3723,11 +3781,11 @@ def create_app(
                         str(uuid4()),
                         project_id,
                         batch_id,
-                        item.id,
-                        f"第 {item.episodeNumber} 集 · 镜头组 {item.groupIndex}（{item.durationSeconds}秒）",
-                        item.prompt,
-                        item.durationSeconds,
-                        item.aspectRatio,
+                        "+".join(item.id for item in items),
+                        f"第 {first_item.episodeNumber} 集 · 镜头组 {group_label}（30秒）",
+                        build_video_batch_prompt(items),
+                        VIDEO_REQUEST_SECONDS,
+                        first_item.aspectRatio,
                         json.dumps(references, ensure_ascii=False),
                         settings.model,
                         now,

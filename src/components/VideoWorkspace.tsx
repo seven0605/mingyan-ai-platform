@@ -41,6 +41,32 @@ interface VideoWorkspaceProps {
 }
 
 const KIND_LABEL = { character: "角色", scene: "场景", prop: "道具" } as const;
+const VIDEO_REQUEST_SECONDS = 30;
+
+function countVideoRequests(items: VideoProductionPlanItem[], selectedIds: string[]) {
+  const selected = new Set(selectedIds);
+  let count = 0;
+  let batchSeconds = 0;
+  let previous: VideoProductionPlanItem | null = null;
+
+  for (const item of items) {
+    if (!selected.has(item.id)) continue;
+    const canAppend = previous
+      && item.episodeNumber === previous.episodeNumber
+      && item.groupIndex === previous.groupIndex + 1
+      && item.aspectRatio === previous.aspectRatio
+      && item.targetModel === previous.targetModel
+      && batchSeconds + item.durationSeconds <= VIDEO_REQUEST_SECONDS;
+    if (canAppend) {
+      batchSeconds += item.durationSeconds;
+    } else {
+      count += 1;
+      batchSeconds = item.durationSeconds;
+    }
+    previous = item;
+  }
+  return count;
+}
 
 export function VideoWorkspace({
   project,
@@ -97,6 +123,7 @@ export function VideoWorkspace({
   const activeItem = plan?.items.find((item) => item.id === activeId) ?? null;
   const readyItems = plan?.items.filter((item) => item.ready) ?? [];
   const blockedCount = (plan?.items.length ?? 0) - readyItems.length;
+  const requestCount = countVideoRequests(plan?.items ?? [], selectedIds);
 
   const toggleItem = (item: VideoProductionPlanItem) => {
     if (!item.ready) return;
@@ -209,7 +236,7 @@ export function VideoWorkspace({
           <section className="video-plan-toolbar">
             <div>
               <strong>视频生产预检</strong>
-              <span>保存清单不会调用视频模型，也不会消耗额度。</span>
+              <span>保存清单不消耗额度；生成时连续分镜自动合并，每条固定 30 秒并按条计费。</span>
             </div>
             <button className="button secondary compact" type="button" onClick={() => void loadPlan()}>
               <RefreshCw size={15} /> 刷新预检
@@ -340,7 +367,7 @@ export function VideoWorkspace({
             <Film size={21} />
             <div>
               <strong>{videoModelConfigured ? "视频模型已配置" : "下一步：配置视频模型"}</strong>
-              <p>{videoModelConfigured ? "提交后将自动开启白名单素材通道，完成或失败后自动关闭。" : "先保存服务商、模型和密钥，并进行不会消耗额度的模型列表测试。"}</p>
+              <p>{videoModelConfigured ? `已选 ${selectedIds.length} 个分镜组，预计提交 ${requestCount} 条 30 秒视频；素材通道会自动开启并关闭。` : "先保存服务商、模型和密钥，并进行不会消耗额度的模型列表测试。"}</p>
             </div>
             <div className="video-next-actions">
               <button className="button secondary compact" type="button" onClick={onOpenApiSettings}>
@@ -354,7 +381,7 @@ export function VideoWorkspace({
                   onClick={() => void queueVideos()}
                 >
                   {queueing ? <LoaderCircle className="spinning" size={15} /> : <Play size={15} />}
-                  {queueing ? "正在提交…" : `开始生成 ${selectedIds.length} 组（消耗额度）`}
+                  {queueing ? "正在提交…" : `生成 ${requestCount} 条30秒视频（按条计费）`}
                 </button>
               ) : null}
             </div>
