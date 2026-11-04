@@ -291,7 +291,7 @@ export function ApiSettings({
           <h2>密钥保存在系统凭据库</h2>
           <p>macOS 使用钥匙串，Windows 使用凭据管理器。SQLite 只记录接口地址和模型名称。</p>
           {isImage || isVideo ? <p className="credential-test-note">连接测试只读取服务商模型列表，不会生成{isImage ? "图片" : "视频"}，也不会消耗生成额度。</p> : null}
-          {isVideo ? <p className="credential-test-note">本地资产不能直接作为参考图提交；正式生成前需要增加临时公网素材上传。</p> : null}
+          {isVideo ? <p className="credential-test-note">正式生成时会自动建立白名单临时 HTTPS 通道；任务完成或失败后立即关闭。</p> : null}
           <dl>
             <div><dt>服务商</dt><dd>{isImage ? "不鸣AI" : isVideo ? "睡哭了" : "OpenAI 兼容"}</dd></div>
             <div><dt>模型</dt><dd>{model || "尚未填写"}</dd></div>

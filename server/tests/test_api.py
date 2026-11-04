@@ -6,7 +6,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from server.app import asset_aspect_ratio, create_app, is_collective_character
-from server.asset_tunnel import TemporaryAssetTunnel
+from server.asset_tunnel import AssetTunnelStatus, TemporaryAssetTunnel
 
 
 class MemoryCredentialStore:
@@ -18,6 +18,43 @@ class MemoryCredentialStore:
 
     def set(self, name: str, value: str) -> None:
         self.values[name] = value
+
+
+class FakeAssetTunnel:
+    def __init__(self) -> None:
+        self.project_id: str | None = None
+        self.running = False
+        self.start_count = 0
+
+    def cloudflared_path(self) -> Path:
+        return Path("/fake/cloudflared")
+
+    def status(self) -> AssetTunnelStatus:
+        return AssetTunnelStatus(
+            installed=True,
+            running=self.running,
+            project_id=self.project_id if self.running else None,
+            public_url="https://assets.example.com" if self.running else None,
+            exposed_asset_count=1 if self.running else 0,
+            error="",
+        )
+
+    def start(self, project_id: str, files: dict[str, Path]) -> dict[str, str]:
+        assert files
+        self.project_id = project_id
+        self.running = True
+        self.start_count += 1
+        return {
+            logical_id: f"https://assets.example.com/{self.start_count}/{logical_id}.png"
+            for logical_id in files
+        }
+
+    def stop(self) -> None:
+        self.running = False
+        self.project_id = None
+
+    def served_request_count(self) -> int:
+        return 1
 
 
 def test_collective_characters_use_widescreen() -> None:
@@ -42,6 +79,7 @@ def test_temporary_asset_gateway_only_serves_whitelisted_files(tmp_path: Path) -
         assert response.headers["cache-control"] == "private, no-store"
         assert response.content.endswith(b"public-test")
         assert httpx.head(urls["allowed"]).status_code == 200
+        assert tunnel.served_request_count() == 2
         local_root = urls["allowed"].split("/media/", 1)[0]
         assert httpx.get(f"{local_root}/api/projects").status_code == 404
         assert httpx.get(f"{local_root}/media/wrong-token/hidden.png").status_code == 404
@@ -55,6 +93,8 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
     invalid_storyboard = False
     image_generation_failed = False
     image_requests: list[dict] = []
+    video_requests: list[dict] = []
+    fake_tunnel = FakeAssetTunnel()
 
     script_plan_payload = {
         "title": "凤掌九天",
@@ -290,6 +330,44 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
                     "cost": 0.23,
                 },
             )
+        if request.url.path == "/v1/videos":
+            assert request.headers["Authorization"] == "Bearer video-secret-not-for-sqlite"
+            request_payload = json.loads(request.content)
+            video_requests.append(request_payload)
+            assert request_payload["model"] == "BD Seedance2.5"
+            assert "【参考图顺序锁定】图1=" in request_payload["prompt"]
+            assert request_payload["seconds"] == "15"
+            assert request_payload["size"] == "1280x720"
+            reference_urls = request_payload["metadata"]["__workbench_refs"][
+                "reference_image_urls"
+            ]
+            assert len(reference_urls) >= 2
+            assert all(
+                url.startswith("https://assets.example.com/")
+                for url in reference_urls
+            )
+            return httpx.Response(
+                200, json={"id": f"video-task-{len(video_requests)}"}
+            )
+        if request.url.path.endswith("/content") and request.url.path.startswith(
+            "/v1/videos/"
+        ):
+            assert request.headers["Authorization"] == "Bearer video-secret-not-for-sqlite"
+            return httpx.Response(
+                200,
+                content=b"mock-mp4-content",
+                headers={"content-type": "video/mp4"},
+            )
+        if request.url.path.startswith("/v1/videos/"):
+            assert request.headers["Authorization"] == "Bearer video-secret-not-for-sqlite"
+            return httpx.Response(
+                200,
+                json={
+                    "id": request.url.path.rsplit("/", 1)[-1],
+                    "status": "completed",
+                    "cost": 6.9,
+                },
+            )
         if request.url.path == "/v1/models":
             assert request.headers["Authorization"] in {
                 "Bearer secret-not-for-sqlite",
@@ -402,6 +480,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             static_dir=Path("missing"),
             credential_store=credentials,
             model_transport=model_transport,
+            asset_tunnel_service=fake_tunnel,
         )
     ) as client:
         health = client.get("/api/health")
@@ -955,11 +1034,27 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert confirmed_video_plan.json()["current"] is True
         assert confirmed_video_plan.json()["selectedItemIds"] == selected_video_ids
         assert client.get("/api/projects").json()[0]["stage"] == "video"
-        missing_cloudflared = client.post(
-            f"/api/projects/{project['id']}/asset-tunnel"
+        queued_videos = client.post(
+            f"/api/projects/{project['id']}/video-plan/queue"
         )
-        assert missing_cloudflared.status_code == 409
-        assert "cloudflared" in missing_cloudflared.json()["detail"]
+        assert queued_videos.status_code == 200
+        assert [task["type"] for task in queued_videos.json()] == ["video", "video"]
+        assert [task["status"] for task in queued_videos.json()] == ["queued", "queued"]
+        assert len(video_requests) == 2
+        assert fake_tunnel.start_count == 2
+        assert fake_tunnel.running is False
+        video_tasks = [
+            task
+            for task in client.get(f"/api/projects/{project['id']}/tasks").json()
+            if task["type"] == "video"
+        ]
+        assert len(video_tasks) == 2
+        assert all(task["status"] == "completed" for task in video_tasks)
+        assert all(task["providerTaskId"].startswith("video-task-") for task in video_tasks)
+        generated_video = client.get(video_tasks[0]["resultUrl"])
+        assert generated_video.status_code == 200
+        assert generated_video.headers["content-type"] == "video/mp4"
+        assert generated_video.content == b"mock-mp4-content"
 
         assert client.put(
             f"/api/projects/{project['id']}/assets/{yun_zishu_id}/images/{generated_image['id']}/primary"
@@ -1013,7 +1108,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert restored_yun_zishu["primaryReferenceImageId"] == generated_image["id"]
         assert client.get(restored_yun_zishu["referenceImages"][0]["url"]).status_code == 200
         restored_tasks = client.get(f"/api/projects/{projects[0]['id']}/tasks").json()
-        assert len(restored_tasks) == 3
+        assert len(restored_tasks) == 5
         assert all(task["status"] == "completed" for task in restored_tasks)
         restored_batch_plan = client.get(
             f"/api/projects/{projects[0]['id']}/assets/batch-plan"

@@ -4874,7 +4874,8 @@ textarea:focus-visible {
   cursor: pointer;
 }
 
-.task-preview-panel > img {
+.task-preview-panel > img,
+.task-preview-panel > video {
   width: 100%;
   height: min(80vh, 1050px);
   display: block;
@@ -5364,7 +5365,7 @@ textarea:focus-visible {
   font-size: 12px;
 }
 
-.video-next-step > div {
+.video-next-step > div:first-of-type {
   flex: 1;
 }
 
@@ -5372,6 +5373,12 @@ textarea:focus-visible {
   margin: 4px 0 0;
   color: var(--muted);
   font-size: 10px;
+}
+
+.video-next-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .spinning {

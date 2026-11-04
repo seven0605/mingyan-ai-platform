@@ -312,6 +312,12 @@ export function confirmVideoProductionPlan(projectId: string, itemIds: string[])
   });
 }
 
+export function queueVideoProductionPlan(projectId: string) {
+  return request<ProjectTask[]>(`/api/projects/${projectId}/video-plan/queue`, {
+    method: "POST",
+  });
+}
+
 export function getAssetTunnelStatus() {
   return request<AssetTunnelStatus>("/api/settings/asset-tunnel");
 }

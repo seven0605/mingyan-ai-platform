@@ -547,11 +547,11 @@ class AssetTunnelStatusOut(BaseModel):
 class ProjectTaskOut(BaseModel):
     id: str
     projectId: str
-    type: Literal["asset-image"]
+    type: Literal["asset-image", "video"]
     status: Literal["queued", "running", "completed", "failed", "interrupted"]
     title: str
     assetId: str
-    assetKind: Literal["character", "scene", "prop"]
+    assetKind: Literal["character", "scene", "prop", "video"]
     providerTaskId: str
     model: str
     resultUrl: str
@@ -726,6 +726,31 @@ def initialize_database(database_path: Path) -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS video_generation_jobs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                plan_item_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                seconds INTEGER NOT NULL,
+                aspect_ratio TEXT NOT NULL,
+                reference_assets TEXT NOT NULL,
+                model TEXT NOT NULL,
+                status TEXT NOT NULL,
+                provider_task_id TEXT NOT NULL DEFAULT '',
+                result_url TEXT NOT NULL DEFAULT '',
+                cost REAL,
+                error TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """
+        )
         screenplay_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(project_screenplays)").fetchall()
@@ -879,9 +904,10 @@ def build_video_plan_items(
                     ),
                     asset.referenceImages[0] if asset.referenceImages else None,
                 )
-                if direct and asset.status != "confirmed":
+                requires_reference = asset.kind != "prop"
+                if direct and requires_reference and asset.status != "confirmed":
                     blocking_reasons.append(f"{asset.name} 尚未确认")
-                elif direct and primary is None:
+                elif direct and requires_reference and primary is None:
                     blocking_reasons.append(f"{asset.name} 缺少主参考图")
                 if primary is not None and asset.status == "confirmed":
                     references.append(
@@ -954,6 +980,27 @@ def row_to_generation_task(row: sqlite3.Row) -> ProjectTaskOut:
         title=row["title"],
         assetId=row["asset_id"],
         assetKind=row["asset_kind"],
+        providerTaskId=row["provider_task_id"],
+        model=row["model"],
+        resultUrl=row["result_url"],
+        cost=row["cost"],
+        batchId=row["batch_id"],
+        error=row["error"],
+        attemptCount=row["attempt_count"],
+        createdAt=row["created_at"],
+        updatedAt=row["updated_at"],
+    )
+
+
+def row_to_video_generation_task(row: sqlite3.Row) -> ProjectTaskOut:
+    return ProjectTaskOut(
+        id=row["id"],
+        projectId=row["project_id"],
+        type="video",
+        status=row["status"],
+        title=row["title"],
+        assetId=row["plan_item_id"],
+        assetKind="video",
         providerTaskId=row["provider_task_id"],
         model=row["model"],
         resultUrl=row["result_url"],
@@ -1411,13 +1458,14 @@ def create_app(
     static_dir: Path | None = None,
     credential_store: CredentialStore | None = None,
     model_transport: httpx.BaseTransport | None = None,
+    asset_tunnel_service: TemporaryAssetTunnel | None = None,
 ) -> FastAPI:
     resolved_data_dir = data_dir or Path(
         os.environ.get("MINGYAN_DATA_DIR", Path.home() / ".mingyan-ai")
     )
     database_path = resolved_data_dir / "mingyan.sqlite3"
     credentials = credential_store or SystemCredentialStore()
-    asset_tunnel = TemporaryAssetTunnel(resolved_data_dir)
+    asset_tunnel = asset_tunnel_service or TemporaryAssetTunnel(resolved_data_dir)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -1428,6 +1476,16 @@ def create_app(
                 UPDATE asset_generation_jobs
                 SET status = 'interrupted',
                     error = '本地服务曾在队列执行期间停止；已有服务商任务号时将复用原任务。',
+                    updated_at = ?
+                WHERE status IN ('queued', 'running')
+                """,
+                (utc_now(),),
+            )
+            connection.execute(
+                """
+                UPDATE video_generation_jobs
+                SET status = 'interrupted',
+                    error = '本地服务曾在视频任务执行期间停止；已有服务商任务号时将只恢复查询。',
                     updated_at = ?
                 WHERE status IN ('queued', 'running')
                 """,
@@ -1893,6 +1951,299 @@ def create_app(
                 with connect(database_path) as connection:
                     saved = connection.execute(
                         "SELECT status FROM asset_generation_jobs WHERE id = ?",
+                        (queued["id"],),
+                    ).fetchone()
+                if saved is not None and saved["status"] == "interrupted":
+                    return
+
+    def video_response_detail(response: httpx.Response, fallback: str) -> str:
+        try:
+            payload = response.json()
+        except ValueError:
+            return fallback
+        if not isinstance(payload, dict):
+            return fallback
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return str(error.get("message") or error.get("code") or fallback)
+        detail = payload.get("detail") or payload.get("message")
+        if isinstance(detail, (dict, list)):
+            detail = json.dumps(detail, ensure_ascii=False)
+        return str(error or detail or payload.get("fail_reason") or fallback)
+
+    def process_video_job(job_id: str) -> None:
+        with connect(database_path) as connection:
+            job = connection.execute(
+                "SELECT * FROM video_generation_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if job is None or job["status"] != "running":
+            return
+
+        provider_task_id = job["provider_task_id"]
+        recoverable = bool(provider_task_id)
+        tunnel_started = False
+        temporary_path: Path | None = None
+        try:
+            settings, api_key = video_model_credentials()
+            api_root = settings.baseUrl.rstrip("/")
+            headers = {"Authorization": f"Bearer {api_key}"}
+            status_payload: dict = {}
+            with httpx.Client(
+                transport=model_transport,
+                timeout=httpx.Timeout(60, connect=30),
+                follow_redirects=True,
+            ) as client:
+                if not provider_task_id:
+                    references = json.loads(job["reference_assets"])
+                    files: dict[str, Path] = {}
+                    for reference in references:
+                        logical_id = str(reference["logicalId"])
+                        image_path = asset_reference_file_path(
+                            job["project_id"],
+                            str(reference["assetId"]),
+                            str(reference["imageId"]),
+                        )
+                        if image_path is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=f"{reference['name']} 的主参考图文件不存在",
+                            )
+                        files[logical_id] = image_path
+                    reference_urls = asset_tunnel.start(job["project_id"], files)
+                    tunnel_started = True
+                    ordered_urls = [
+                        reference_urls[str(reference["logicalId"])]
+                        for reference in references
+                    ]
+                    reference_guide = "；".join(
+                        f"图{index}={reference['name']}"
+                        for index, reference in enumerate(references, start=1)
+                    )
+                    created = client.post(
+                        f"{api_root}/videos",
+                        headers={**headers, "Content-Type": "application/json"},
+                        json={
+                            "model": job["model"],
+                            "prompt": (
+                                f"【参考图顺序锁定】{reference_guide}。"
+                                "人物身份、服装和场景分别以对应参考图为准。\n\n"
+                                f"{job['prompt']}"
+                            ),
+                            "seconds": str(job["seconds"]),
+                            "size": (
+                                "1280x720"
+                                if job["aspect_ratio"] == "16:9"
+                                else "720x1280"
+                            ),
+                            "metadata": {
+                                "__workbench_passthrough": {
+                                    "aspect_ratio": job["aspect_ratio"],
+                                    "resolution": "720p",
+                                },
+                                "__workbench_refs": {
+                                    "reference_image_urls": ordered_urls,
+                                    "reference_video_urls": [],
+                                    "reference_audio_urls": [],
+                                },
+                            },
+                        },
+                    )
+                    if not created.is_success:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=video_response_detail(
+                                created,
+                                f"视频服务创建任务失败（HTTP {created.status_code}）",
+                            ),
+                        )
+                    try:
+                        created_payload = created.json()
+                    except ValueError as error:
+                        raise HTTPException(
+                            status_code=502, detail="视频服务返回了无法识别的任务数据"
+                        ) from error
+                    provider_task_id = str(
+                        created_payload.get("id")
+                        or created_payload.get("task_id")
+                        or ""
+                    )
+                    if not provider_task_id:
+                        raise HTTPException(status_code=502, detail="视频服务没有返回任务编号")
+                    recoverable = True
+                    with connect(database_path) as connection:
+                        connection.execute(
+                            """
+                            UPDATE video_generation_jobs
+                            SET provider_task_id = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (provider_task_id, utc_now(), job_id),
+                        )
+
+                deadline = time.monotonic() + 45 * 60
+                while time.monotonic() < deadline:
+                    status_response = client.get(
+                        f"{api_root}/videos/{provider_task_id}", headers=headers
+                    )
+                    if not status_response.is_success:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=video_response_detail(
+                                status_response,
+                                f"视频任务查询失败（HTTP {status_response.status_code}）",
+                            ),
+                        )
+                    try:
+                        status_payload = status_response.json()
+                    except ValueError as error:
+                        raise HTTPException(
+                            status_code=502, detail="视频任务状态无法识别"
+                        ) from error
+                    state = str(
+                        status_payload.get("status")
+                        or status_payload.get("state")
+                        or ""
+                    ).lower()
+                    if state == "completed":
+                        break
+                    if state == "failed":
+                        recoverable = False
+                        failure = status_payload.get("error")
+                        if isinstance(failure, dict):
+                            failure = failure.get("message") or failure.get("code")
+                        raise HTTPException(
+                            status_code=502,
+                            detail=str(
+                                failure
+                                or status_payload.get("fail_reason")
+                                or "视频任务生成失败"
+                            ),
+                        )
+                    time.sleep(5)
+                else:
+                    raise HTTPException(status_code=504, detail="视频任务等待超时，可稍后恢复查询")
+
+                video_dir = resolved_data_dir / "generated" / job["project_id"] / "videos"
+                video_dir.mkdir(parents=True, exist_ok=True)
+                video_path = video_dir / f"{job_id}.mp4"
+                temporary_path = video_dir / f".{job_id}.tmp"
+                total_bytes = 0
+                with client.stream(
+                    "GET",
+                    f"{api_root}/videos/{provider_task_id}/content",
+                    headers=headers,
+                ) as content_response:
+                    if content_response.status_code not in {200, 206}:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"视频生成成功，但下载成品失败（HTTP {content_response.status_code}）",
+                        )
+                    content_type = content_response.headers.get(
+                        "content-type", ""
+                    ).split(";", 1)[0]
+                    if content_type != "video/mp4":
+                        raise HTTPException(
+                            status_code=502, detail="视频服务返回的成品不是 MP4 文件"
+                        )
+                    with temporary_path.open("wb") as output:
+                        for chunk in content_response.iter_bytes(512 * 1024):
+                            if not chunk:
+                                continue
+                            total_bytes += len(chunk)
+                            if total_bytes > 2 * 1024 * 1024 * 1024:
+                                raise HTTPException(
+                                    status_code=502, detail="视频成品超过 2GB 安全限制"
+                                )
+                            output.write(chunk)
+                if total_bytes == 0:
+                    raise HTTPException(status_code=502, detail="视频服务返回了空成品")
+                temporary_path.replace(video_path)
+                temporary_path = None
+
+            raw_cost = status_payload.get("cost")
+            cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
+            now = utc_now()
+            result_url = f"/api/projects/{job['project_id']}/videos/{job_id}/content"
+            with connect(database_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE video_generation_jobs
+                    SET status = 'completed', provider_task_id = ?, result_url = ?,
+                        cost = ?, error = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (provider_task_id, result_url, cost, now, job_id),
+                )
+        except (
+            HTTPException,
+            httpx.RequestError,
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            KeyError,
+        ) as error:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            if isinstance(error, HTTPException):
+                message = str(error.detail)
+            elif isinstance(error, httpx.RequestError):
+                message = f"视频服务连接中断：{type(error).__name__}"
+            else:
+                message = str(error) or type(error).__name__
+            if tunnel_started and "参考素材" in message:
+                message = (
+                    f"{message}（临时素材网关成功命中 "
+                    f"{asset_tunnel.served_request_count()} 次）"
+                )
+            status = "interrupted" if recoverable else "failed"
+            with connect(database_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE video_generation_jobs
+                    SET status = ?, provider_task_id = ?, error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, provider_task_id, message, utc_now(), job_id),
+                )
+        finally:
+            if tunnel_started:
+                asset_tunnel.stop()
+
+    def process_video_batch(batch_id: str) -> None:
+        while True:
+            with connect(database_path) as connection:
+                running = connection.execute(
+                    """
+                    SELECT id FROM video_generation_jobs
+                    WHERE batch_id = ? AND status = 'running'
+                    """,
+                    (batch_id,),
+                ).fetchone()
+                if running is not None:
+                    return
+                queued = connection.execute(
+                    """
+                    SELECT id FROM video_generation_jobs
+                    WHERE batch_id = ? AND status = 'queued'
+                    ORDER BY created_at, id LIMIT 1
+                    """,
+                    (batch_id,),
+                ).fetchone()
+                if queued is None:
+                    return
+                claimed = connection.execute(
+                    """
+                    UPDATE video_generation_jobs
+                    SET status = 'running', error = '', updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (utc_now(), queued["id"]),
+                )
+            if claimed.rowcount:
+                process_video_job(queued["id"])
+                with connect(database_path) as connection:
+                    saved = connection.execute(
+                        "SELECT status FROM video_generation_jobs WHERE id = ?",
                         (queued["id"],),
                     ).fetchone()
                 if saved is not None and saved["status"] == "interrupted":
@@ -3181,6 +3532,52 @@ def create_app(
             raise HTTPException(status_code=409, detail="请先建立一致性资产库")
         return storyboard_rows, asset_row, saved_plan
 
+    def selected_video_plan_items(project_id: str) -> list[VideoProductionPlanItem]:
+        storyboard_rows, asset_row, saved_plan = video_plan_inputs(project_id)
+        items, storyboard_updated_at, asset_library_updated_at = (
+            build_video_plan_items(storyboard_rows, asset_row)
+        )
+        if (
+            saved_plan is None
+            or saved_plan["storyboard_updated_at"] != storyboard_updated_at
+            or saved_plan["asset_library_updated_at"] != asset_library_updated_at
+        ):
+            raise HTTPException(status_code=409, detail="请先保存当前版本的视频生产清单")
+        selection = VideoPlanSelectionPayload.model_validate(
+            json.loads(saved_plan["payload"])
+        )
+        items_by_id = {item.id: item for item in items}
+        selected_items = [
+            items_by_id[item_id]
+            for item_id in selection.selectedItemIds
+            if item_id in items_by_id
+        ]
+        if not selected_items or len(selected_items) != len(selection.selectedItemIds):
+            raise HTTPException(status_code=409, detail="视频生产清单为空或包含过期镜头组")
+        if any(not item.ready for item in selected_items):
+            raise HTTPException(status_code=409, detail="视频生产清单中仍有未就绪镜头组")
+        return selected_items
+
+    def video_reference_files(
+        project_id: str, items: list[VideoProductionPlanItem]
+    ) -> dict[str, Path]:
+        files: dict[str, Path] = {}
+        for item in items:
+            for reference in item.assetReferences:
+                logical_id = f"{reference.assetId}:{reference.imageId}"
+                if logical_id in files:
+                    continue
+                image_path = asset_reference_file_path(
+                    project_id, reference.assetId, reference.imageId
+                )
+                if image_path is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{reference.name} 的主参考图文件不存在",
+                    )
+                files[logical_id] = image_path
+        return files
+
     @application.get(
         "/api/projects/{project_id}/video-plan",
         response_model=VideoProductionPlanOut,
@@ -3272,49 +3669,88 @@ def create_app(
         )
 
     @application.post(
+        "/api/projects/{project_id}/video-plan/queue",
+        response_model=list[ProjectTaskOut],
+    )
+    def queue_video_production_plan(
+        project_id: str, background_tasks: BackgroundTasks
+    ) -> list[ProjectTaskOut]:
+        settings, _ = video_model_credentials()
+        if asset_tunnel.cloudflared_path() is None:
+            raise HTTPException(
+                status_code=409, detail="尚未安装 cloudflared，无法提交本地参考素材"
+            )
+        tunnel_status = asset_tunnel.status()
+        if tunnel_status.running and tunnel_status.project_id != project_id:
+            raise HTTPException(status_code=409, detail="临时通道正在被其他项目使用")
+        selected_items = selected_video_plan_items(project_id)
+        video_reference_files(project_id, selected_items)
+        with connect(database_path) as connection:
+            active = connection.execute(
+                """
+                SELECT id FROM video_generation_jobs
+                WHERE status IN ('queued', 'running', 'interrupted')
+                LIMIT 1
+                """
+            ).fetchone()
+        if active is not None:
+            raise HTTPException(
+                status_code=409, detail="已有未完成的视频任务，请先在任务中心处理"
+            )
+
+        batch_id = str(uuid4())
+        with connect(database_path) as connection:
+            for item in selected_items:
+                now = utc_now()
+                references = [
+                    {
+                        "logicalId": f"{reference.assetId}:{reference.imageId}",
+                        "assetId": reference.assetId,
+                        "imageId": reference.imageId,
+                        "name": reference.name,
+                    }
+                    for reference in item.assetReferences
+                ]
+                connection.execute(
+                    """
+                    INSERT INTO video_generation_jobs (
+                        id, project_id, batch_id, plan_item_id, title, prompt,
+                        seconds, aspect_ratio, reference_assets, model, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        project_id,
+                        batch_id,
+                        item.id,
+                        f"第 {item.episodeNumber} 集 · 镜头组 {item.groupIndex}（{item.durationSeconds}秒）",
+                        item.prompt,
+                        item.durationSeconds,
+                        item.aspectRatio,
+                        json.dumps(references, ensure_ascii=False),
+                        settings.model,
+                        now,
+                        now,
+                    ),
+                )
+            rows = connection.execute(
+                """
+                SELECT * FROM video_generation_jobs
+                WHERE batch_id = ? ORDER BY created_at, id
+                """,
+                (batch_id,),
+            ).fetchall()
+        background_tasks.add_task(process_video_batch, batch_id)
+        return [row_to_video_generation_task(row) for row in rows]
+
+    @application.post(
         "/api/projects/{project_id}/asset-tunnel",
         response_model=AssetTunnelStatusOut,
     )
     def start_asset_tunnel(project_id: str) -> AssetTunnelStatusOut:
-        storyboard_rows, asset_row, saved_plan = video_plan_inputs(project_id)
-        items, storyboard_updated_at, asset_library_updated_at = (
-            build_video_plan_items(storyboard_rows, asset_row)
-        )
-        if (
-            saved_plan is None
-            or saved_plan["storyboard_updated_at"] != storyboard_updated_at
-            or saved_plan["asset_library_updated_at"] != asset_library_updated_at
-        ):
-            raise HTTPException(status_code=409, detail="请先保存当前版本的视频生产清单")
-        selection = VideoPlanSelectionPayload.model_validate(
-            json.loads(saved_plan["payload"])
-        )
-        items_by_id = {item.id: item for item in items}
-        selected_items = [
-            items_by_id[item_id]
-            for item_id in selection.selectedItemIds
-            if item_id in items_by_id
-        ]
-        if not selected_items or len(selected_items) != len(selection.selectedItemIds):
-            raise HTTPException(status_code=409, detail="视频生产清单为空或包含过期镜头组")
-        if any(not item.ready for item in selected_items):
-            raise HTTPException(status_code=409, detail="视频生产清单中仍有未就绪镜头组")
-
-        files: dict[str, Path] = {}
-        for item in selected_items:
-            for reference in item.assetReferences:
-                logical_id = f"{reference.assetId}:{reference.imageId}"
-                if logical_id in files:
-                    continue
-                image_path = asset_reference_file_path(
-                    project_id, reference.assetId, reference.imageId
-                )
-                if image_path is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"{reference.name} 的主参考图文件不存在",
-                    )
-                files[logical_id] = image_path
+        selected_items = selected_video_plan_items(project_id)
+        files = video_reference_files(project_id, selected_items)
         try:
             asset_tunnel.start(project_id, files)
         except FileNotFoundError as error:
@@ -3578,14 +4014,26 @@ def create_app(
                 """,
                 (project_id,),
             ).fetchall()
+            video_rows = connection.execute(
+                """
+                SELECT * FROM video_generation_jobs
+                WHERE project_id = ? ORDER BY created_at DESC
+                """,
+                (project_id,),
+            ).fetchall()
         jobs = [row_to_generation_task(row) for row in job_rows]
+        video_jobs = [row_to_video_generation_task(row) for row in video_rows]
         job_ids = {task.id for task in jobs}
         legacy = [
             task
             for task in (asset_library_tasks(asset_row) if asset_row else [])
             if task.id not in job_ids
         ]
-        return sorted([*jobs, *legacy], key=lambda task: task.createdAt, reverse=True)
+        return sorted(
+            [*video_jobs, *jobs, *legacy],
+            key=lambda task: task.createdAt,
+            reverse=True,
+        )
 
     @application.post(
         "/api/projects/{project_id}/tasks/{task_id}/retry",
@@ -3595,32 +4043,62 @@ def create_app(
         project_id: str, task_id: str, background_tasks: BackgroundTasks
     ) -> ProjectTaskOut:
         with connect(database_path) as connection:
-            row = connection.execute(
+            image_row = connection.execute(
                 """
                 SELECT * FROM asset_generation_jobs
                 WHERE id = ? AND project_id = ?
                 """,
                 (task_id, project_id),
             ).fetchone()
+            video_row = (
+                connection.execute(
+                    """
+                    SELECT * FROM video_generation_jobs
+                    WHERE id = ? AND project_id = ?
+                    """,
+                    (task_id, project_id),
+                ).fetchone()
+                if image_row is None
+                else None
+            )
+            row = image_row or video_row
             if row is None:
                 raise HTTPException(status_code=404, detail="生成任务不存在")
             if row["status"] != "failed":
                 raise HTTPException(status_code=409, detail="只有失败任务可以重新生成")
-            connection.execute(
-                """
-                UPDATE asset_generation_jobs
-                SET status = 'queued', provider_task_id = '', result_url = '',
-                    cost = NULL, error = '', attempt_count = attempt_count + 1,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (utc_now(), task_id),
-            )
-            saved = connection.execute(
-                "SELECT * FROM asset_generation_jobs WHERE id = ?", (task_id,)
-            ).fetchone()
-        background_tasks.add_task(process_generation_batch, row["batch_id"])
-        return row_to_generation_task(saved)
+            if image_row is not None:
+                connection.execute(
+                    """
+                    UPDATE asset_generation_jobs
+                    SET status = 'queued', provider_task_id = '', result_url = '',
+                        cost = NULL, error = '', attempt_count = attempt_count + 1,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (utc_now(), task_id),
+                )
+                saved = connection.execute(
+                    "SELECT * FROM asset_generation_jobs WHERE id = ?", (task_id,)
+                ).fetchone()
+            else:
+                connection.execute(
+                    """
+                    UPDATE video_generation_jobs
+                    SET status = 'queued', provider_task_id = '', result_url = '',
+                        cost = NULL, error = '', attempt_count = attempt_count + 1,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (utc_now(), task_id),
+                )
+                saved = connection.execute(
+                    "SELECT * FROM video_generation_jobs WHERE id = ?", (task_id,)
+                ).fetchone()
+        if image_row is not None:
+            background_tasks.add_task(process_generation_batch, row["batch_id"])
+            return row_to_generation_task(saved)
+        background_tasks.add_task(process_video_batch, row["batch_id"])
+        return row_to_video_generation_task(saved)
 
     @application.post(
         "/api/projects/{project_id}/tasks/resume",
@@ -3630,7 +4108,7 @@ def create_app(
         project_id: str, background_tasks: BackgroundTasks
     ) -> list[ProjectTaskOut]:
         with connect(database_path) as connection:
-            rows = connection.execute(
+            image_rows = connection.execute(
                 """
                 SELECT * FROM asset_generation_jobs
                 WHERE project_id = ? AND status IN ('queued', 'interrupted')
@@ -3638,7 +4116,15 @@ def create_app(
                 """,
                 (project_id,),
             ).fetchall()
-            if not rows:
+            video_rows = connection.execute(
+                """
+                SELECT * FROM video_generation_jobs
+                WHERE project_id = ? AND status IN ('queued', 'interrupted')
+                ORDER BY created_at, id
+                """,
+                (project_id,),
+            ).fetchall()
+            if not image_rows and not video_rows:
                 raise HTTPException(status_code=409, detail="没有可恢复的生成任务")
             connection.execute(
                 """
@@ -3648,7 +4134,15 @@ def create_app(
                 """,
                 (utc_now(), project_id),
             )
-            saved = connection.execute(
+            connection.execute(
+                """
+                UPDATE video_generation_jobs
+                SET status = 'queued', error = '', updated_at = ?
+                WHERE project_id = ? AND status = 'interrupted'
+                """,
+                (utc_now(), project_id),
+            )
+            saved_images = connection.execute(
                 """
                 SELECT * FROM asset_generation_jobs
                 WHERE project_id = ? AND status = 'queued'
@@ -3656,9 +4150,22 @@ def create_app(
                 """,
                 (project_id,),
             ).fetchall()
-        for batch_id in dict.fromkeys(row["batch_id"] for row in saved):
+            saved_videos = connection.execute(
+                """
+                SELECT * FROM video_generation_jobs
+                WHERE project_id = ? AND status = 'queued'
+                ORDER BY created_at, id
+                """,
+                (project_id,),
+            ).fetchall()
+        for batch_id in dict.fromkeys(row["batch_id"] for row in saved_images):
             background_tasks.add_task(process_generation_batch, batch_id)
-        return [row_to_generation_task(row) for row in saved]
+        for batch_id in dict.fromkeys(row["batch_id"] for row in saved_videos):
+            background_tasks.add_task(process_video_batch, batch_id)
+        return [
+            *[row_to_generation_task(row) for row in saved_images],
+            *[row_to_video_generation_task(row) for row in saved_videos],
+        ]
 
     @application.get(
         "/api/projects/{project_id}/assets/{asset_id}/images/{image_id}"
@@ -3691,6 +4198,34 @@ def create_app(
         if not candidates:
             raise HTTPException(status_code=404, detail="本地参考图文件不存在")
         return FileResponse(candidates[0])
+
+    @application.get("/api/projects/{project_id}/videos/{task_id}/content")
+    def get_generated_video(project_id: str, task_id: str) -> FileResponse:
+        try:
+            UUID(project_id)
+            UUID(task_id)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail="视频成品不存在") from error
+        with connect(database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT status FROM video_generation_jobs
+                WHERE id = ? AND project_id = ?
+                """,
+                (task_id, project_id),
+            ).fetchone()
+        if row is None or row["status"] != "completed":
+            raise HTTPException(status_code=404, detail="视频成品不存在")
+        video_path = (
+            resolved_data_dir
+            / "generated"
+            / project_id
+            / "videos"
+            / f"{task_id}.mp4"
+        )
+        if not video_path.is_file():
+            raise HTTPException(status_code=404, detail="本地视频文件不存在")
+        return FileResponse(video_path, media_type="video/mp4")
 
     @application.post(
         "/api/projects/{project_id}/assets/extract", response_model=AssetLibraryOut

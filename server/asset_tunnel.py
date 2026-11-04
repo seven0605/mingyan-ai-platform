@@ -48,6 +48,7 @@ class TemporaryAssetTunnel:
         self._project_id: str | None = None
         self._public_url: str | None = None
         self._error = ""
+        self._served_request_count = 0
 
     def cloudflared_path(self) -> Path | None:
         configured = os.environ.get("MINGYAN_CLOUDFLARED_PATH", "").strip()
@@ -105,6 +106,7 @@ class TemporaryAssetTunnel:
                 self._route_keys[logical_id] = route_key
             self._project_id = project_id
             self._error = ""
+            self._served_request_count = 0
 
             tunnel = self
 
@@ -184,6 +186,10 @@ class TemporaryAssetTunnel:
         with self._lock:
             self._stop_unlocked()
 
+    def served_request_count(self) -> int:
+        with self._lock:
+            return self._served_request_count
+
     def _wait_for_public_url(self, output_queue: Queue[str]) -> str:
         public_url = ""
         registered = False
@@ -222,6 +228,8 @@ class TemporaryAssetTunnel:
         if file_path is None:
             handler.send_error(404)
             return
+        with self._lock:
+            self._served_request_count += 1
         try:
             size = file_path.stat().st_size
             content_type = CONTENT_TYPES[file_path.suffix.lower()]

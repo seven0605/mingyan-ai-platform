@@ -388,11 +388,11 @@ export type ProjectTaskStatus = "queued" | "running" | "completed" | "failed" | 
 export interface ProjectTask {
   id: string;
   projectId: string;
-  type: "asset-image";
+  type: "asset-image" | "video";
   status: ProjectTaskStatus;
   title: string;
   assetId: string;
-  assetKind: AssetKind;
+  assetKind: AssetKind | "video";
   providerTaskId: string;
   model: string;
   resultUrl: string;

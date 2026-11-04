@@ -28,6 +28,7 @@ const ASSET_KIND_LABEL = {
   character: "角色",
   scene: "场景",
   prop: "物品",
+  video: "视频",
 } as const;
 
 const TASK_STATUS_META = {
@@ -84,7 +85,8 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
   }, [project?.id, hasActiveTasks]);
 
   const filteredTasks = useMemo(() => {
-    if (filter === "video") return [];
+    if (filter === "image") return tasks.filter((task) => task.type === "asset-image");
+    if (filter === "video") return tasks.filter((task) => task.type === "video");
     return tasks;
   }, [filter, tasks]);
 
@@ -184,13 +186,14 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
                 {filteredTasks.map((task) => {
                   const statusMeta = TASK_STATUS_META[task.status];
                   const StatusIcon = statusMeta.icon;
+                  const TaskIcon = task.type === "video" ? Video : ImageIcon;
                   return (
                   <article className="task-row" role="row" key={task.id}>
                     <div className="task-name-cell">
-                      <span className="task-type-icon"><ImageIcon size={17} /></span>
+                      <span className="task-type-icon"><TaskIcon size={17} /></span>
                       <div>
                         <strong>{task.title}</strong>
-                        <span>{ASSET_KIND_LABEL[task.assetKind]}资产 · 第 {task.attemptCount} 次执行</span>
+                        <span>{task.type === "video" ? "视频生成" : `${ASSET_KIND_LABEL[task.assetKind]}资产`} · 第 {task.attemptCount} 次执行</span>
                         {task.error ? <small>{task.error}</small> : null}
                       </div>
                     </div>
@@ -217,7 +220,7 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
               <div className="task-empty compact">
                 {filter === "video" ? <Video size={25} /> : <ImageIcon size={25} />}
                 <h2>{filter === "video" ? "尚无视频任务" : "尚无生成任务"}</h2>
-                <p>{filter === "video" ? "视频模型接入后，生成记录会显示在这里。" : "完成第一张资产参考图后，记录会自动出现在这里。"}</p>
+                <p>{filter === "video" ? "从视频生产工作台提交后，状态与成品会显示在这里。" : "完成第一张资产参考图后，记录会自动出现在这里。"}</p>
                 {filter !== "video" ? <button className="button secondary compact" type="button" onClick={onOpenAssets}>前往资产工作台</button> : null}
               </div>
             )}
@@ -232,7 +235,11 @@ export function TaskCenter({ project, onBack, onOpenAssets }: TaskCenterProps) {
               <div><strong>{previewTask.title}</strong><span>{previewTask.model} · {previewTask.cost === null ? "无费用记录" : `费用记录 ${previewTask.cost}`}</span></div>
               <button type="button" aria-label="关闭任务结果预览" onClick={() => setPreviewTask(null)} autoFocus><X size={20} /></button>
             </header>
-            <img src={previewTask.resultUrl} alt={`${previewTask.title}生成结果`} />
+            {previewTask.type === "video" ? (
+              <video src={previewTask.resultUrl} controls preload="metadata" />
+            ) : (
+              <img src={previewTask.resultUrl} alt={`${previewTask.title}生成结果`} />
+            )}
           </div>
         </div>
       ) : null}

@@ -139,6 +139,7 @@ export default function App() {
             onBack={() => setActivePage("workspace")}
             onOpenAssets={() => setActivePage("assets")}
             onOpenApiSettings={() => setActivePage("api")}
+            onOpenTasks={() => setActivePage("tasks")}
             onPlanReady={() => updateStage("video")}
             videoModelConfigured={videoModelSettings?.configured ?? false}
           />

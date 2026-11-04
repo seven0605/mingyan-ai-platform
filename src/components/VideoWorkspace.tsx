@@ -9,6 +9,7 @@ import {
   Image as ImageIcon,
   ListVideo,
   LoaderCircle,
+  Play,
   RefreshCw,
   Save,
   ShieldCheck,
@@ -18,6 +19,7 @@ import {
   confirmVideoProductionPlan,
   getAssetTunnelStatus,
   getVideoProductionPlan,
+  queueVideoProductionPlan,
   startAssetTunnel,
   stopAssetTunnel,
 } from "../lib/api";
@@ -33,6 +35,7 @@ interface VideoWorkspaceProps {
   onBack: () => void;
   onOpenAssets: () => void;
   onOpenApiSettings: () => void;
+  onOpenTasks: () => void;
   onPlanReady: () => Promise<void>;
   videoModelConfigured: boolean;
 }
@@ -44,6 +47,7 @@ export function VideoWorkspace({
   onBack,
   onOpenAssets,
   onOpenApiSettings,
+  onOpenTasks,
   onPlanReady,
   videoModelConfigured,
 }: VideoWorkspaceProps) {
@@ -54,6 +58,7 @@ export function VideoWorkspace({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [tunnelBusy, setTunnelBusy] = useState(false);
+  const [queueing, setQueueing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const projectId = project?.id;
 
@@ -132,6 +137,20 @@ export function VideoWorkspace({
       setError(tunnelError instanceof Error ? tunnelError.message : "临时素材通道操作失败");
     } finally {
       setTunnelBusy(false);
+    }
+  };
+
+  const queueVideos = async () => {
+    if (!project) return;
+    setQueueing(true);
+    setError(null);
+    try {
+      await queueVideoProductionPlan(project.id);
+      onOpenTasks();
+    } catch (queueError) {
+      setError(queueError instanceof Error ? queueError.message : "视频任务提交失败");
+    } finally {
+      setQueueing(false);
     }
   };
 
@@ -321,11 +340,24 @@ export function VideoWorkspace({
             <Film size={21} />
             <div>
               <strong>{videoModelConfigured ? "视频模型已配置" : "下一步：配置视频模型"}</strong>
-              <p>{videoModelConfigured ? "连接已保存；正式生成前仍需完成素材公网直链与额度确认。" : "先保存服务商、模型和密钥，并进行不会消耗额度的模型列表测试。"}</p>
+              <p>{videoModelConfigured ? "提交后将自动开启白名单素材通道，完成或失败后自动关闭。" : "先保存服务商、模型和密钥，并进行不会消耗额度的模型列表测试。"}</p>
             </div>
-            <button className="button secondary compact" type="button" onClick={onOpenApiSettings}>
-              {videoModelConfigured ? "查看配置" : "配置视频模型"}
-            </button>
+            <div className="video-next-actions">
+              <button className="button secondary compact" type="button" onClick={onOpenApiSettings}>
+                {videoModelConfigured ? "查看配置" : "配置视频模型"}
+              </button>
+              {videoModelConfigured ? (
+                <button
+                  className="button primary compact"
+                  type="button"
+                  disabled={queueing || !plan.current || !selectedIds.length || !tunnel?.installed}
+                  onClick={() => void queueVideos()}
+                >
+                  {queueing ? <LoaderCircle className="spinning" size={15} /> : <Play size={15} />}
+                  {queueing ? "正在提交…" : `开始生成 ${selectedIds.length} 组（消耗额度）`}
+                </button>
+              ) : null}
+            </div>
           </footer>
         </>
       )}
