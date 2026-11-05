@@ -201,11 +201,13 @@ def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) 
                 "baseUrl": "https://h3.example.com/",
                 "workflowName": "H3 15秒测试工作流",
                 "workflowJson": json.dumps(workflow),
+                "allowInsecureTls": True,
             },
         )
         assert saved.status_code == 200
         assert saved.json()["configured"] is True
         assert saved.json()["workflowConfigured"] is True
+        assert saved.json()["allowInsecureTls"] is True
         tested = client.post("/api/settings/comfyui-video/test")
         assert tested.status_code == 200
         assert tested.json()["model"] == "MiniMax H3"

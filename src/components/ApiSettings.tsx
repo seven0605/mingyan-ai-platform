@@ -72,6 +72,7 @@ export function ApiSettings({
   const [apiKey, setApiKey] = useState("");
   const [workflowName, setWorkflowName] = useState("MiniMax H3 · 15秒 API 工作流");
   const [workflowJson, setWorkflowJson] = useState("");
+  const [allowInsecureTls, setAllowInsecureTls] = useState(false);
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -102,6 +103,7 @@ export function ApiSettings({
         setModel("MiniMax H3");
         setWorkflowName(comfyUIVideoSettings?.workflowName || "MiniMax H3 · 15秒 API 工作流");
         setWorkflowJson(comfyUIVideoSettings?.workflowJson || "");
+        setAllowInsecureTls(comfyUIVideoSettings?.allowInsecureTls ?? false);
       } else {
         setBaseUrl(videoSettings?.baseUrl || VIDEO_DEFAULT_BASE_URL);
         setModel(videoSettings?.model || VIDEO_DEFAULT_MODEL);
@@ -119,7 +121,8 @@ export function ApiSettings({
     ? Boolean(
       baseUrl.trim() !== comfyUIVideoSettings?.baseUrl
       || workflowName.trim() !== comfyUIVideoSettings?.workflowName
-      || workflowJson.trim() !== comfyUIVideoSettings?.workflowJson,
+      || workflowJson.trim() !== comfyUIVideoSettings?.workflowJson
+      || allowInsecureTls !== comfyUIVideoSettings?.allowInsecureTls,
     )
     : Boolean(
       baseUrl.trim() !== settings?.baseUrl || model.trim() !== settings?.model || apiKey.trim(),
@@ -184,6 +187,7 @@ export function ApiSettings({
             baseUrl: baseUrl.trim(),
             workflowName: workflowName.trim(),
             workflowJson: workflowJson.trim(),
+            allowInsecureTls,
           }));
           setMessage("云端 ComfyUI H3 配置已保存，可以进行免生成连接测试。");
         } else {
@@ -388,6 +392,17 @@ export function ApiSettings({
                   required
                 />
                 <small>必须使用 API 格式工作流，不是普通界面工作流。至少包含 {"{{prompt}}"} 和 {"{{reference_1}}"}；MP4 必须由 SaveVideo 节点输出。</small>
+              </label>
+              <label className="settings-checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={allowInsecureTls}
+                  onChange={(event) => setAllowInsecureTls(event.target.checked)}
+                />
+                <span>
+                  <strong>允许当前云机使用自签名 HTTPS 证书</strong>
+                  <small>仅在 AutoDL 地址出现证书校验失败时开启；只影响这个 ComfyUI 连接。</small>
+                </span>
               </label>
             </>
           )}

@@ -95,6 +95,7 @@ export interface ComfyUIVideoSettings {
   model: "MiniMax H3";
   workflowName: string;
   workflowJson: string;
+  allowInsecureTls: boolean;
   workflowConfigured: boolean;
   configured: boolean;
   updatedAt: string | null;

@@ -89,7 +89,8 @@ docker compose up --build
 1. 在 AutoDL 等云 GPU 上部署官方 MiniMax H3 与 ComfyUI，并让 ComfyUI 监听平台映射的 `6006` 端口。
 2. 从 ComfyUI 导出“API 格式”工作流 JSON，再在 JSON 中把对应输入值改为 `{{prompt}}`、`{{reference_1}}`、`{{reference_2}}`、`{{seconds}}`、`{{width}}`、`{{height}}` 或 `{{seed}}`。
 3. 在“API 设置 → 视频生成模型”选择“云端 ComfyUI H3”，填写 6006 HTTP 映射地址并导入 JSON。
-4. 保存后先执行免生成连接测试。测试只读取 `/system_stats`，不会运行 H3 或产生生成任务。
+4. AutoDL 地址如使用自签名证书，明确勾选“允许当前云机使用自签名 HTTPS 证书”；该开关只作用于这一个 ComfyUI 地址。
+5. 保存后先执行免生成连接测试。测试只读取 `/system_stats`，不会运行 H3 或产生生成任务。
 
 ComfyUI 自托管接口本身默认没有登录保护。不要分享 AutoDL 映射地址，也不要把外部服务密钥直接写入工作流节点。
 

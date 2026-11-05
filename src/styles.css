@@ -2106,6 +2106,39 @@ textarea:focus-visible {
   font-size: 11px;
 }
 
+.settings-checkbox-field {
+  max-width: 720px;
+  margin-top: 18px;
+  padding: 12px 13px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid rgba(213, 185, 131, 0.2);
+  border-radius: 8px;
+  background: rgba(145, 106, 48, 0.06);
+}
+
+.settings-checkbox-field input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.settings-checkbox-field span {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-checkbox-field strong {
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
+.settings-checkbox-field small {
+  color: #8b8790;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .secret-input {
   position: relative;
 }

@@ -154,6 +154,7 @@ export function saveComfyUIVideoSettings(input: {
   baseUrl: string;
   workflowName: string;
   workflowJson: string;
+  allowInsecureTls: boolean;
 }) {
   return request<ComfyUIVideoSettings>("/api/settings/comfyui-video", {
     method: "PUT",

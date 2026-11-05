@@ -169,6 +169,7 @@ class ComfyUIVideoSettingsUpdate(BaseModel):
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)
     ]
     workflowJson: Annotated[str, StringConstraints(min_length=2, max_length=5_000_000)]
+    allowInsecureTls: bool = False
 
     @field_validator("baseUrl")
     @classmethod
@@ -209,6 +210,7 @@ class ComfyUIVideoSettingsOut(BaseModel):
     model: Literal["MiniMax H3"]
     workflowName: str
     workflowJson: str
+    allowInsecureTls: bool
     workflowConfigured: bool
     configured: bool
     updatedAt: str | None
@@ -800,6 +802,7 @@ def initialize_database(database_path: Path) -> None:
                 base_url TEXT NOT NULL,
                 workflow_name TEXT NOT NULL,
                 workflow_json TEXT NOT NULL,
+                allow_insecure_tls INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             )
             """
@@ -952,6 +955,14 @@ def initialize_database(database_path: Path) -> None:
         if "backend" not in video_job_columns:
             connection.execute(
                 "ALTER TABLE video_generation_jobs ADD COLUMN backend TEXT NOT NULL DEFAULT 'api'"
+            )
+        comfyui_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(comfyui_video_settings)").fetchall()
+        }
+        if "allow_insecure_tls" not in comfyui_columns:
+            connection.execute(
+                "ALTER TABLE comfyui_video_settings ADD COLUMN allow_insecure_tls INTEGER NOT NULL DEFAULT 0"
             )
 
 
@@ -1973,6 +1984,7 @@ def create_app(
             model="MiniMax H3",
             workflowName=workflow_name,
             workflowJson=workflow_json,
+            allowInsecureTls=bool(row["allow_insecure_tls"]) if row else False,
             workflowConfigured=workflow_configured,
             configured=bool(base_url and workflow_name and workflow_configured),
             updatedAt=row["updated_at"] if row else None,
@@ -2443,6 +2455,7 @@ def create_app(
             }
             with httpx.Client(
                 transport=model_transport,
+                verify=not settings.allowInsecureTls,
                 timeout=httpx.Timeout(120, connect=30),
                 follow_redirects=True,
             ) as client:
@@ -2527,6 +2540,22 @@ def create_app(
                         raise HTTPException(
                             status_code=502, detail="ComfyUI 返回了无法识别的任务数据"
                         ) from error
+                    node_errors = created_payload.get("node_errors")
+                    if isinstance(node_errors, dict) and node_errors:
+                        details: list[str] = []
+                        for node_error in node_errors.values():
+                            if not isinstance(node_error, dict):
+                                continue
+                            for item in node_error.get("errors", []):
+                                if isinstance(item, dict):
+                                    detail = item.get("details") or item.get("message")
+                                    if detail:
+                                        details.append(str(detail))
+                        summary = "；".join(details[:3]) or "请检查节点输入与模型文件"
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"ComfyUI 工作流校验失败：{summary}",
+                        )
                     provider_task_id = str(created_payload.get("prompt_id") or "")
                     if not provider_task_id:
                         raise HTTPException(status_code=502, detail="ComfyUI 未返回 prompt_id")
@@ -3198,15 +3227,23 @@ def create_app(
             connection.execute(
                 """
                 INSERT INTO comfyui_video_settings (
-                    id, base_url, workflow_name, workflow_json, updated_at
-                ) VALUES (1, ?, ?, ?, ?)
+                    id, base_url, workflow_name, workflow_json,
+                    allow_insecure_tls, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     base_url = excluded.base_url,
                     workflow_name = excluded.workflow_name,
                     workflow_json = excluded.workflow_json,
+                    allow_insecure_tls = excluded.allow_insecure_tls,
                     updated_at = excluded.updated_at
                 """,
-                (payload.baseUrl, payload.workflowName, payload.workflowJson, now),
+                (
+                    payload.baseUrl,
+                    payload.workflowName,
+                    payload.workflowJson,
+                    int(payload.allowInsecureTls),
+                    now,
+                ),
             )
         return comfyui_video_settings()
 
@@ -3218,7 +3255,10 @@ def create_app(
         started_at = time.perf_counter()
         try:
             with httpx.Client(
-                transport=model_transport, timeout=15, follow_redirects=True
+                transport=model_transport,
+                verify=not settings.allowInsecureTls,
+                timeout=15,
+                follow_redirects=True,
             ) as client:
                 response = client.get(f"{settings.baseUrl}/system_stats")
         except httpx.RequestError as error:
