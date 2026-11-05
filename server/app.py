@@ -769,9 +769,11 @@ def apply_h3_continuity_override(content: str, enabled: bool) -> str:
         return content
     instruction = (
         "[Shot 1] [First-frame authority] Use the literal pixels of <Picture 1> as "
-        "frame zero. Continue the motion visibly implied by those pixels immediately, "
-        "without a hold, freeze, reset, repeated action, pose restaging, camera-axis "
-        "change, or lighting jump. Any following textual claim about the opening image is "
+        "frame zero. Keep that same shot for 0.8-1.0 seconds while immediately continuing "
+        "the motion visibly implied by those pixels. Never use a one-frame flash or cut "
+        "away before 0.8 seconds, and do not hold, freeze, reset, repeat an action, restage "
+        "a pose, change the camera axis, or jump the lighting. Any following textual claim "
+        "about the opening image is "
         "non-authoritative when it conflicts with <Picture 1>."
     )
     return content.replace("[Shot 1]", instruction, 1)
@@ -786,6 +788,19 @@ def extract_h3_literal_locks(prompts: list[str]) -> list[str]:
             if lock not in locks:
                 locks.append(lock)
     return locks
+
+
+def enforce_h3_axis_continuity(content: str) -> str:
+    content = re.sub(
+        r"(?i)(?:cutting|moving|rotating|shifting) across the 180-degree axis(?: line)?",
+        "remaining on the original side of the 180-degree axis and shifting",
+        content,
+    )
+    return re.sub(
+        r"(?i)crossing the 180-degree axis(?: line)?",
+        "preserving the original side of the 180-degree axis",
+        content,
+    )
 
 
 def connect(database_path: Path) -> sqlite3.Connection:
@@ -2083,9 +2098,10 @@ When <Picture 1> is an exact first-frame anchor, you cannot inspect its pixels.
 Never claim it shows a particular person, pose, prop, framing, or action unless that
 fact is independently guaranteed by the source. In [Shot 1], state that the video
 opens on the exact pixels of <Picture 1> and immediately continues the visible motion
-without a hold, freeze, reset, repeated action, pose restaging, camera-axis change,
-or lighting jump. The picture overrides any conflicting source description. Only
-after that continuous movement may the next requested action begin.
+in the same shot for 0.8-1.0 seconds. Never use a one-frame flash or cut away before
+0.8 seconds. Do not hold, freeze, reset, repeat an action, restage a pose, change the
+camera axis, or jump the lighting. The picture overrides any conflicting source
+description. Only after that continuous movement may the next requested action begin.
 """.strip()
         summary_prefix = (
             "[keyframe completion + reference generation]"
@@ -2094,9 +2110,10 @@ after that continuous movement may the next requested action begin.
         )
         continuity_instruction = (
             "Begin [Shot 1] exactly from <Picture 1> and continue the prior motion "
-            "immediately from the preserved pose and direction without a hold, freeze, "
-            "reset, teleport, repeated action, pose restaging, camera-axis change, or "
-            "lighting jump.\n\n"
+            "immediately in the same shot for 0.8-1.0 seconds from the preserved pose "
+            "and direction. Never use a one-frame flash or cut away before 0.8 seconds; "
+            "do not hold, freeze, reset, teleport, repeat an action, restage a pose, "
+            "change the camera axis, or jump the lighting.\n\n"
             if has_continuity
             else ""
         )
@@ -2169,6 +2186,7 @@ after that continuous movement may the next requested action begin.
                 f"IMMUTABLE IDENTITY AND WARDROBE CONTRACT:\n{literal_lock_block}\nsummary:",
                 1,
             )
+        content = enforce_h3_axis_continuity(content)
         return apply_h3_continuity_override(content, has_continuity)
 
     def image_model_settings() -> ImageModelSettingsOut:

@@ -12,6 +12,7 @@ from server.app import (
     build_video_batch_prompt,
     comfyui_history_error,
     create_app,
+    enforce_h3_axis_continuity,
     extract_h3_literal_locks,
     fit_h3_references,
     is_collective_character,
@@ -187,7 +188,8 @@ def test_h3_continuity_override_makes_picture_pixels_authoritative() -> None:
     prompt = "detailed_description:\n[Shot 1] The subject raises her arm."
     continued = apply_h3_continuity_override(prompt, True)
     assert "literal pixels of <Picture 1>" in continued
-    assert "without a hold, freeze, reset" in continued
+    assert "same shot for 0.8-1.0 seconds" in continued
+    assert "Never use a one-frame flash" in continued
     assert "[Shot 1] The subject raises her arm." not in continued
     assert apply_h3_continuity_override(prompt, False) == prompt
 
@@ -204,6 +206,17 @@ def test_h3_literal_locks_keep_exact_outfit_wording() -> None:
         "云子姝：粉桃短袄、浅青马面裙；禁止换装。",
         "萧云衡：淡藕灰锦袍；禁止换装或伤痕消失。",
     ]
+
+
+def test_h3_axis_continuity_removes_cross_axis_language() -> None:
+    prompt = (
+        "[Shot 2] cutting across the 180-degree axis line by 50 degrees. "
+        "[Shot 3] crossing the 180-degree axis."
+    )
+    fixed = enforce_h3_axis_continuity(prompt)
+    assert "across the 180-degree axis" not in fixed
+    assert "crossing the 180-degree axis" not in fixed
+    assert fixed.count("original side of the 180-degree axis") == 2
 
 
 def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) -> None:
