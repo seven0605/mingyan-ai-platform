@@ -16,6 +16,7 @@ from server.app import (
     extract_h3_literal_locks,
     fit_h3_references,
     h3_authoritative_source,
+    h3_shot_density_valid,
     is_collective_character,
     pack_video_plan_items,
 )
@@ -218,6 +219,9 @@ def test_h3_axis_continuity_removes_cross_axis_language() -> None:
     assert "across the 180-degree axis" not in fixed
     assert "crossing the 180-degree axis" not in fixed
     assert fixed.count("original side of the 180-degree axis") == 2
+    assert "across the 180-degree axis" not in enforce_h3_axis_continuity(
+        "[Shot 2] cut across the 180-degree axis to an over-the-shoulder shot."
+    )
 
 
 def test_h3_authoritative_source_drops_duplicate_storyboard_prose() -> None:
@@ -228,6 +232,12 @@ def test_h3_authoritative_source_drops_duplicate_storyboard_prose() -> None:
     assert h3_authoritative_source(prompt) == (
         "[出镜角色-物品-场景]\n权威七模块执行稿"
     )
+
+
+def test_h3_shot_density_requires_five_to_seven_shots_for_fifteen_seconds() -> None:
+    five_shots = "\n".join(f"[Shot {index}]" for index in range(1, 6))
+    assert h3_shot_density_valid(five_shots, 15)
+    assert not h3_shot_density_valid("[Shot 1]\n[Shot 2]\n[Shot 3]", 15)
 
 
 def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) -> None:

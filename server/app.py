@@ -792,7 +792,7 @@ def extract_h3_literal_locks(prompts: list[str]) -> list[str]:
 
 def enforce_h3_axis_continuity(content: str) -> str:
     content = re.sub(
-        r"(?i)(?:cutting|moving|rotating|shifting) across the 180-degree axis(?: line)?",
+        r"(?i)(?:cuts?|cutting|moving|rotating|shifting) across the 180-degree axis(?: line)?",
         "remaining on the original side of the 180-degree axis and shifting",
         content,
     )
@@ -809,6 +809,13 @@ def h3_authoritative_source(prompt: str) -> str:
         return prompt.split(marker, 1)[1].strip()
     start = prompt.find("[出镜角色-物品-场景]")
     return prompt[start:].strip() if start >= 0 else prompt.strip()
+
+
+def h3_shot_density_valid(content: str, seconds: int) -> bool:
+    if seconds < 10:
+        return True
+    shot_count = len(re.findall(r"(?m)^\[Shot \d+\]", content))
+    return 5 <= shot_count <= 7
 
 
 def connect(database_path: Path) -> sqlite3.Connection:
@@ -2101,6 +2108,12 @@ object, or environmental cutaway. Describe composition, positions, appearance,
 lighting, physical actions and state changes, camera movement, sound, and the exact
 moment each reference takes effect. Keep actions physically plausible. Do not add
 new characters, events, props, or dialogue. No Markdown fences and no commentary.
+For every 10-15 second target, detailed_description must contain 5-7 shots. Keep
+each shot between 2 and 4 seconds and never longer than 5 seconds. If one spoken
+line would occupy more than 4 seconds, preserve that dialogue verbatim while using
+a reaction shot, an object/action insert, or an environmental cutaway to break up
+the direct-to-camera coverage. Never pad the duration with a freeze, repeated
+action, reset, or redundant restaging.
 
 When <Picture 1> is an exact first-frame anchor, you cannot inspect its pixels.
 Never claim it shows a particular person, pose, prop, framing, or action unless that
@@ -2193,6 +2206,11 @@ description. Only after that continuous movement may the next requested action b
                 "summary:",
                 f"IMMUTABLE IDENTITY AND WARDROBE CONTRACT:\n{literal_lock_block}\nsummary:",
                 1,
+            )
+        if not h3_shot_density_valid(content, seconds):
+            raise HTTPException(
+                status_code=502,
+                detail="H3 提示词未达到每15秒5至7个微镜头的硬性标准，请重试",
             )
         content = enforce_h3_axis_continuity(content)
         return apply_h3_continuity_override(content, has_continuity)
