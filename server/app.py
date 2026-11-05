@@ -47,6 +47,8 @@ CHAPTER_HEADING = re.compile(
     re.MULTILINE,
 )
 VIDEO_REQUEST_SECONDS = 30
+H3_REQUEST_SECONDS = 15
+COMFYUI_PLACEHOLDER = re.compile(r"\{\{([a-z0-9_]+)\}\}")
 
 
 class ProjectCreate(BaseModel):
@@ -158,6 +160,69 @@ class VideoModelSettingsOut(BaseModel):
     model: str
     hasCredential: bool
     configured: bool
+    updatedAt: str | None
+
+
+class ComfyUIVideoSettingsUpdate(BaseModel):
+    baseUrl: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+    workflowName: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)
+    ]
+    workflowJson: Annotated[str, StringConstraints(min_length=2, max_length=5_000_000)]
+
+    @field_validator("baseUrl")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("ComfyUI 地址必须是有效的 http 或 https 地址")
+        return value.rstrip("/")
+
+    @field_validator("workflowJson")
+    @classmethod
+    def validate_workflow_json(cls, value: str) -> str:
+        try:
+            workflow = json.loads(value)
+        except ValueError as error:
+            raise ValueError("工作流必须是有效的 API 格式 JSON") from error
+        if not isinstance(workflow, dict) or not workflow:
+            raise ValueError("工作流必须是非空的 API 格式 JSON 对象")
+        placeholders = comfyui_workflow_placeholders(workflow)
+        if "prompt" not in placeholders:
+            raise ValueError("工作流缺少 {{prompt}} 提示词占位符")
+        if "reference_1" not in placeholders:
+            raise ValueError("工作流缺少 {{reference_1}} 首张参考图占位符")
+        unsupported = {
+            item
+            for item in placeholders
+            if item not in {"prompt", "seconds", "width", "height", "seed"}
+            and not re.fullmatch(r"reference_[1-9][0-9]*", item)
+        }
+        if unsupported:
+            raise ValueError(f"工作流包含不支持的占位符：{', '.join(sorted(unsupported))}")
+        return json.dumps(workflow, ensure_ascii=False)
+
+
+class ComfyUIVideoSettingsOut(BaseModel):
+    provider: Literal["comfyui-h3"]
+    baseUrl: str
+    model: Literal["MiniMax H3"]
+    workflowName: str
+    workflowJson: str
+    workflowConfigured: bool
+    configured: bool
+    updatedAt: str | None
+
+
+class VideoBackendUpdate(BaseModel):
+    activeBackend: Literal["api", "comfyui"]
+
+
+class VideoBackendOut(BaseModel):
+    activeBackend: Literal["api", "comfyui"]
+    configured: bool
+    apiConfigured: bool
+    comfyuiConfigured: bool
     updatedAt: str | None
 
 
@@ -616,6 +681,62 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def comfyui_workflow_placeholders(value: object) -> set[str]:
+    placeholders: set[str] = set()
+    if isinstance(value, str):
+        placeholders.update(COMFYUI_PLACEHOLDER.findall(value))
+    elif isinstance(value, dict):
+        for item in value.values():
+            placeholders.update(comfyui_workflow_placeholders(item))
+    elif isinstance(value, list):
+        for item in value:
+            placeholders.update(comfyui_workflow_placeholders(item))
+    return placeholders
+
+
+def render_comfyui_workflow(value: object, replacements: dict[str, object]) -> object:
+    if isinstance(value, str):
+        exact = COMFYUI_PLACEHOLDER.fullmatch(value)
+        if exact and exact.group(1) in replacements:
+            return replacements[exact.group(1)]
+        rendered = value
+        for name, replacement in replacements.items():
+            rendered = rendered.replace(f"{{{{{name}}}}}", str(replacement))
+        return rendered
+    if isinstance(value, dict):
+        return {
+            key: render_comfyui_workflow(item, replacements)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [render_comfyui_workflow(item, replacements) for item in value]
+    return value
+
+
+def comfyui_video_output(history_item: dict) -> dict[str, str] | None:
+    outputs = history_item.get("outputs")
+    if not isinstance(outputs, dict):
+        return None
+    for node_output in outputs.values():
+        if not isinstance(node_output, dict):
+            continue
+        for collection in node_output.values():
+            if not isinstance(collection, list):
+                continue
+            for item in collection:
+                if not isinstance(item, dict):
+                    continue
+                filename = str(item.get("filename") or "")
+                if Path(filename).suffix.lower() != ".mp4":
+                    continue
+                return {
+                    "filename": filename,
+                    "subfolder": str(item.get("subfolder") or ""),
+                    "type": str(item.get("type") or "output"),
+                }
+    return None
+
+
 def connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -668,6 +789,17 @@ def initialize_database(database_path: Path) -> None:
                 kind TEXT PRIMARY KEY,
                 base_url TEXT NOT NULL,
                 model TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS comfyui_video_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                base_url TEXT NOT NULL,
+                workflow_name TEXT NOT NULL,
+                workflow_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
@@ -788,6 +920,7 @@ def initialize_database(database_path: Path) -> None:
                 aspect_ratio TEXT NOT NULL,
                 reference_assets TEXT NOT NULL,
                 model TEXT NOT NULL,
+                backend TEXT NOT NULL DEFAULT 'api',
                 status TEXT NOT NULL,
                 provider_task_id TEXT NOT NULL DEFAULT '',
                 result_url TEXT NOT NULL DEFAULT '',
@@ -811,6 +944,14 @@ def initialize_database(database_path: Path) -> None:
         if "approved_at" not in screenplay_columns:
             connection.execute(
                 "ALTER TABLE project_screenplays ADD COLUMN approved_at TEXT"
+            )
+        video_job_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(video_generation_jobs)").fetchall()
+        }
+        if "backend" not in video_job_columns:
+            connection.execute(
+                "ALTER TABLE video_generation_jobs ADD COLUMN backend TEXT NOT NULL DEFAULT 'api'"
             )
 
 
@@ -1162,6 +1303,7 @@ def compile_storyboard_group_prompt(group: StoryboardGroup) -> str:
 
 def pack_video_plan_items(
     items: list[VideoProductionPlanItem],
+    request_seconds: int = VIDEO_REQUEST_SECONDS,
 ) -> list[list[VideoProductionPlanItem]]:
     ordered = sorted(items, key=lambda item: (item.episodeNumber, item.groupIndex))
     batches: list[list[VideoProductionPlanItem]] = []
@@ -1175,7 +1317,7 @@ def pack_video_plan_items(
             and item.groupIndex == previous.groupIndex + 1
             and item.aspectRatio == previous.aspectRatio
             and item.targetModel == previous.targetModel
-            and current_seconds + item.durationSeconds <= VIDEO_REQUEST_SECONDS
+            and current_seconds + item.durationSeconds <= request_seconds
         )
         if can_append:
             current.append(item)
@@ -1184,10 +1326,14 @@ def pack_video_plan_items(
     return batches
 
 
-def build_video_batch_prompt(items: list[VideoProductionPlanItem]) -> str:
+def build_video_batch_prompt(
+    items: list[VideoProductionPlanItem],
+    request_seconds: int = VIDEO_REQUEST_SECONDS,
+    model_name: str = "BD Seedance2.5",
+) -> str:
     cursor = 0
     sections = [
-        "【任务参数】BD Seedance2.5，30秒，写实电影质感。",
+        f"【任务参数】{model_name}，{request_seconds}秒，写实电影质感。",
         "【全局连续性硬锁】严格按以下时间轴执行；各段人物身份、五官、年龄、体态、服装、发型、伤势、道具、场景结构、主光方向、站位与运动方向连续，不得重复前段剧情，不得越轴。动作遵守重力、惯性、接触与受力反馈。",
     ]
     for item in items:
@@ -1197,13 +1343,13 @@ def build_video_batch_prompt(items: list[VideoProductionPlanItem]) -> str:
             f"叙事目的：{item.purpose}\n{item.prompt}"
         )
         cursor = end
-    if cursor < VIDEO_REQUEST_SECONDS:
+    if cursor < request_seconds:
         sections.append(
-            f"【{cursor:02d}-{VIDEO_REQUEST_SECONDS:02d}秒｜自然收束】\n"
+            f"【{cursor:02d}-{request_seconds:02d}秒｜自然收束】\n"
             "延续最后一个镜头的动作和情绪，让表演、环境声与镜头运动自然收束；不新增人物、事件或台词。"
         )
     sections.append(
-        "【终帧连续性】30秒终帧保持最后一段人物位置、朝向、姿态、表情、服装、伤势、手中物、场景结构和光线，形成可供下一条视频直接顺接的稳定构图。"
+        f"【终帧连续性】{request_seconds}秒终帧保持最后一段人物位置、朝向、姿态、表情、服装、伤势、手中物、场景结构和光线，形成可供下一条视频直接顺接的稳定构图。"
     )
     return "\n\n".join(sections)
 
@@ -1801,6 +1947,65 @@ def create_app(
             raise HTTPException(status_code=409, detail="系统凭据库中没有找到视频 API 密钥")
         return settings, api_key
 
+    def comfyui_video_settings() -> ComfyUIVideoSettingsOut:
+        with connect(database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM comfyui_video_settings WHERE id = 1"
+            ).fetchone()
+        base_url = row["base_url"] if row else ""
+        workflow_name = row["workflow_name"] if row else ""
+        workflow_json = row["workflow_json"] if row else ""
+        workflow_configured = False
+        if workflow_json:
+            try:
+                workflow = json.loads(workflow_json)
+                placeholders = comfyui_workflow_placeholders(workflow)
+                workflow_configured = bool(
+                    isinstance(workflow, dict)
+                    and workflow
+                    and {"prompt", "reference_1"}.issubset(placeholders)
+                )
+            except ValueError:
+                workflow_configured = False
+        return ComfyUIVideoSettingsOut(
+            provider="comfyui-h3",
+            baseUrl=base_url,
+            model="MiniMax H3",
+            workflowName=workflow_name,
+            workflowJson=workflow_json,
+            workflowConfigured=workflow_configured,
+            configured=bool(base_url and workflow_name and workflow_configured),
+            updatedAt=row["updated_at"] if row else None,
+        )
+
+    def configured_comfyui_video_settings() -> ComfyUIVideoSettingsOut:
+        settings = comfyui_video_settings()
+        if not settings.configured:
+            raise HTTPException(
+                status_code=409, detail="请先保存完整的云端 ComfyUI H3 配置"
+            )
+        return settings
+
+    def video_backend_settings() -> VideoBackendOut:
+        with connect(database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM model_settings WHERE kind = ?", ("video-backend",)
+            ).fetchone()
+        active_backend = (
+            row["model"] if row and row["model"] in {"api", "comfyui"} else "api"
+        )
+        api_configured = video_model_settings().configured
+        comfyui_configured = comfyui_video_settings().configured
+        return VideoBackendOut(
+            activeBackend=active_backend,
+            configured=(
+                api_configured if active_backend == "api" else comfyui_configured
+            ),
+            apiConfigured=api_configured,
+            comfyuiConfigured=comfyui_configured,
+            updatedAt=row["updated_at"] if row else None,
+        )
+
     def asset_tunnel_status() -> AssetTunnelStatusOut:
         status = asset_tunnel.status()
         return AssetTunnelStatusOut(
@@ -2207,12 +2412,239 @@ def create_app(
             detail = json.dumps(detail, ensure_ascii=False)
         return str(error or detail or payload.get("fail_reason") or fallback)
 
+    def process_comfyui_video_job(job: sqlite3.Row) -> None:
+        provider_task_id = job["provider_task_id"]
+        recoverable = bool(provider_task_id)
+        temporary_path: Path | None = None
+        try:
+            settings = configured_comfyui_video_settings()
+            workflow_template = json.loads(settings.workflowJson)
+            placeholders = comfyui_workflow_placeholders(workflow_template)
+            reference_indexes = sorted(
+                int(name.rsplit("_", 1)[-1])
+                for name in placeholders
+                if re.fullmatch(r"reference_[1-9][0-9]*", name)
+            )
+            references = json.loads(job["reference_assets"])
+            if reference_indexes and reference_indexes[-1] > len(references):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"H3 工作流需要 {reference_indexes[-1]} 张参考图，"
+                        f"当前任务只有 {len(references)} 张"
+                    ),
+                )
+            replacements: dict[str, object] = {
+                "prompt": job["prompt"],
+                "seconds": job["seconds"],
+                "width": 1280 if job["aspect_ratio"] == "16:9" else 720,
+                "height": 720 if job["aspect_ratio"] == "16:9" else 1280,
+                "seed": int(UUID(job["id"])) % 2_147_483_647,
+            }
+            with httpx.Client(
+                transport=model_transport,
+                timeout=httpx.Timeout(120, connect=30),
+                follow_redirects=True,
+            ) as client:
+                for reference_index in reference_indexes:
+                    reference = references[reference_index - 1]
+                    if reference.get("role") == "identity":
+                        image_path = asset_identity_master_file_path(
+                            job["project_id"],
+                            str(reference["assetId"]),
+                            str(reference["imageId"]),
+                        )
+                    else:
+                        image_path = asset_reference_file_path(
+                            job["project_id"],
+                            str(reference["assetId"]),
+                            str(reference["imageId"]),
+                        )
+                    if image_path is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"{reference['name']} 的参考图文件不存在",
+                        )
+                    content_type = {
+                        ".png": "image/png",
+                        ".jpg": "image/jpeg",
+                        ".jpeg": "image/jpeg",
+                        ".webp": "image/webp",
+                    }.get(image_path.suffix.lower(), "application/octet-stream")
+                    upload_name = (
+                        f"mingyan-{job['id']}-{reference_index}{image_path.suffix.lower()}"
+                    )
+                    uploaded = client.post(
+                        f"{settings.baseUrl}/upload/image",
+                        data={"type": "input", "overwrite": "true"},
+                        files={
+                            "image": (
+                                upload_name,
+                                image_path.read_bytes(),
+                                content_type,
+                            )
+                        },
+                    )
+                    if not uploaded.is_success:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"ComfyUI 上传第 {reference_index} 张参考图失败（HTTP {uploaded.status_code}）",
+                        )
+                    try:
+                        uploaded_payload = uploaded.json()
+                    except ValueError as error:
+                        raise HTTPException(
+                            status_code=502, detail="ComfyUI 返回了无法识别的图片上传结果"
+                        ) from error
+                    saved_name = str(uploaded_payload.get("name") or "")
+                    if not saved_name:
+                        raise HTTPException(status_code=502, detail="ComfyUI 未返回图片文件名")
+                    subfolder = str(uploaded_payload.get("subfolder") or "")
+                    replacements[f"reference_{reference_index}"] = (
+                        f"{subfolder}/{saved_name}" if subfolder else saved_name
+                    )
+
+                workflow = render_comfyui_workflow(workflow_template, replacements)
+                if not provider_task_id:
+                    created = client.post(
+                        f"{settings.baseUrl}/prompt",
+                        json={
+                            "prompt": workflow,
+                            "client_id": str(uuid4()),
+                        },
+                    )
+                    if not created.is_success:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=video_response_detail(
+                                created,
+                                f"ComfyUI 提交 H3 工作流失败（HTTP {created.status_code}）",
+                            ),
+                        )
+                    try:
+                        created_payload = created.json()
+                    except ValueError as error:
+                        raise HTTPException(
+                            status_code=502, detail="ComfyUI 返回了无法识别的任务数据"
+                        ) from error
+                    provider_task_id = str(created_payload.get("prompt_id") or "")
+                    if not provider_task_id:
+                        raise HTTPException(status_code=502, detail="ComfyUI 未返回 prompt_id")
+                    recoverable = True
+                    with connect(database_path) as connection:
+                        connection.execute(
+                            """
+                            UPDATE video_generation_jobs
+                            SET provider_task_id = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (provider_task_id, utc_now(), job["id"]),
+                        )
+
+                deadline = time.monotonic() + 60 * 60
+                video_output: dict[str, str] | None = None
+                while time.monotonic() < deadline:
+                    history_response = client.get(
+                        f"{settings.baseUrl}/history/{provider_task_id}"
+                    )
+                    if not history_response.is_success:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"ComfyUI 任务查询失败（HTTP {history_response.status_code}）",
+                        )
+                    try:
+                        history = history_response.json()
+                    except ValueError as error:
+                        raise HTTPException(status_code=502, detail="ComfyUI 任务状态无法识别") from error
+                    history_item = history.get(provider_task_id) if isinstance(history, dict) else None
+                    if isinstance(history_item, dict):
+                        video_output = comfyui_video_output(history_item)
+                        if video_output:
+                            break
+                        status = history_item.get("status")
+                        if isinstance(status, dict) and status.get("completed"):
+                            recoverable = False
+                            status_text = json.dumps(status, ensure_ascii=False).lower()
+                            if "error" in status_text:
+                                raise HTTPException(status_code=502, detail="H3 工作流执行失败，请查看 ComfyUI 日志")
+                            raise HTTPException(
+                                status_code=502,
+                                detail="H3 工作流已结束，但没有找到 MP4 输出；请检查 SaveVideo 输出节点",
+                            )
+                    time.sleep(5)
+                else:
+                    raise HTTPException(status_code=504, detail="H3 云端任务等待超时，可稍后恢复查询")
+
+                video_dir = resolved_data_dir / "generated" / job["project_id"] / "videos"
+                video_dir.mkdir(parents=True, exist_ok=True)
+                video_path = video_dir / f"{job['id']}.mp4"
+                temporary_path = video_dir / f".{job['id']}.tmp"
+                downloaded = client.get(
+                    f"{settings.baseUrl}/view",
+                    params=video_output,
+                )
+                if not downloaded.is_success:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"H3 生成成功，但下载成品失败（HTTP {downloaded.status_code}）",
+                    )
+                if not downloaded.content:
+                    raise HTTPException(status_code=502, detail="ComfyUI 返回了空视频文件")
+                if len(downloaded.content) > 2 * 1024 * 1024 * 1024:
+                    raise HTTPException(status_code=502, detail="视频成品超过 2GB 安全限制")
+                temporary_path.write_bytes(downloaded.content)
+                temporary_path.replace(video_path)
+                temporary_path = None
+
+            now = utc_now()
+            result_url = f"/api/projects/{job['project_id']}/videos/{job['id']}/content"
+            with connect(database_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE video_generation_jobs
+                    SET status = 'completed', provider_task_id = ?, result_url = ?,
+                        cost = NULL, error = '', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (provider_task_id, result_url, now, job["id"]),
+                )
+        except (
+            HTTPException,
+            httpx.RequestError,
+            sqlite3.Error,
+            OSError,
+            RuntimeError,
+            ValueError,
+            KeyError,
+        ) as error:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            if isinstance(error, HTTPException):
+                message = str(error.detail)
+            elif isinstance(error, httpx.RequestError):
+                message = f"ComfyUI 连接中断：{type(error).__name__}"
+            else:
+                message = str(error) or type(error).__name__
+            status = "interrupted" if recoverable else "failed"
+            with connect(database_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE video_generation_jobs
+                    SET status = ?, provider_task_id = ?, error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, provider_task_id, message, utc_now(), job["id"]),
+                )
+
     def process_video_job(job_id: str) -> None:
         with connect(database_path) as connection:
             job = connection.execute(
                 "SELECT * FROM video_generation_jobs WHERE id = ?", (job_id,)
             ).fetchone()
         if job is None or job["status"] != "running":
+            return
+        if job["backend"] == "comfyui":
+            process_comfyui_video_job(job)
             return
 
         provider_task_id = job["provider_task_id"]
@@ -2748,6 +3180,93 @@ def create_app(
             latencyMs=latency_ms,
             message="鉴权成功，视频模型可用（未生成视频）",
         )
+
+    @application.get(
+        "/api/settings/comfyui-video", response_model=ComfyUIVideoSettingsOut
+    )
+    def get_comfyui_video_settings() -> ComfyUIVideoSettingsOut:
+        return comfyui_video_settings()
+
+    @application.put(
+        "/api/settings/comfyui-video", response_model=ComfyUIVideoSettingsOut
+    )
+    def update_comfyui_video_settings(
+        payload: ComfyUIVideoSettingsUpdate,
+    ) -> ComfyUIVideoSettingsOut:
+        now = utc_now()
+        with connect(database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO comfyui_video_settings (
+                    id, base_url, workflow_name, workflow_json, updated_at
+                ) VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    base_url = excluded.base_url,
+                    workflow_name = excluded.workflow_name,
+                    workflow_json = excluded.workflow_json,
+                    updated_at = excluded.updated_at
+                """,
+                (payload.baseUrl, payload.workflowName, payload.workflowJson, now),
+            )
+        return comfyui_video_settings()
+
+    @application.post(
+        "/api/settings/comfyui-video/test", response_model=TextModelConnectionOut
+    )
+    def test_comfyui_video_connection() -> TextModelConnectionOut:
+        settings = configured_comfyui_video_settings()
+        started_at = time.perf_counter()
+        try:
+            with httpx.Client(
+                transport=model_transport, timeout=15, follow_redirects=True
+            ) as client:
+                response = client.get(f"{settings.baseUrl}/system_stats")
+        except httpx.RequestError as error:
+            raise HTTPException(
+                status_code=502, detail=f"无法连接云端 ComfyUI：{type(error).__name__}"
+            ) from error
+        latency_ms = round((time.perf_counter() - started_at) * 1000)
+        if not response.is_success:
+            raise HTTPException(
+                status_code=502,
+                detail=f"云端 ComfyUI 返回 HTTP {response.status_code}，请检查 6006 映射地址",
+            )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise HTTPException(status_code=502, detail="云端地址不是可识别的 ComfyUI 服务") from error
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="云端地址不是可识别的 ComfyUI 服务")
+        return TextModelConnectionOut(
+            connected=True,
+            model=settings.model,
+            latencyMs=latency_ms,
+            message="ComfyUI 已连接，H3 工作流已就绪（未生成视频）",
+        )
+
+    @application.get(
+        "/api/settings/video-backend", response_model=VideoBackendOut
+    )
+    def get_video_backend() -> VideoBackendOut:
+        return video_backend_settings()
+
+    @application.put(
+        "/api/settings/video-backend", response_model=VideoBackendOut
+    )
+    def update_video_backend(payload: VideoBackendUpdate) -> VideoBackendOut:
+        now = utc_now()
+        with connect(database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO model_settings (kind, base_url, model, updated_at)
+                VALUES ('video-backend', '', ?, ?)
+                ON CONFLICT(kind) DO UPDATE SET
+                    model = excluded.model,
+                    updated_at = excluded.updated_at
+                """,
+                (payload.activeBackend, now),
+            )
+        return video_backend_settings()
 
     @application.get(
         "/api/settings/asset-tunnel", response_model=AssetTunnelStatusOut
@@ -3980,14 +4499,24 @@ def create_app(
     def queue_video_production_plan(
         project_id: str, background_tasks: BackgroundTasks
     ) -> list[ProjectTaskOut]:
-        settings, _ = video_model_credentials()
-        if asset_tunnel.cloudflared_path() is None:
-            raise HTTPException(
-                status_code=409, detail="尚未安装 cloudflared，无法提交本地参考素材"
-            )
-        tunnel_status = asset_tunnel.status()
-        if tunnel_status.running and tunnel_status.project_id != project_id:
-            raise HTTPException(status_code=409, detail="临时通道正在被其他项目使用")
+        backend = video_backend_settings()
+        if not backend.configured:
+            raise HTTPException(status_code=409, detail="当前视频生成通道尚未配置完整")
+        if backend.activeBackend == "api":
+            api_settings, _ = video_model_credentials()
+            request_seconds = VIDEO_REQUEST_SECONDS
+            model_name = api_settings.model
+            if asset_tunnel.cloudflared_path() is None:
+                raise HTTPException(
+                    status_code=409, detail="尚未安装 cloudflared，无法提交本地参考素材"
+                )
+            tunnel_status = asset_tunnel.status()
+            if tunnel_status.running and tunnel_status.project_id != project_id:
+                raise HTTPException(status_code=409, detail="临时通道正在被其他项目使用")
+        else:
+            comfy_settings = configured_comfyui_video_settings()
+            request_seconds = H3_REQUEST_SECONDS
+            model_name = comfy_settings.model
         selected_items = selected_video_plan_items(project_id)
         video_reference_files(project_id, selected_items)
         with connect(database_path) as connection:
@@ -4004,7 +4533,7 @@ def create_app(
             )
 
         batch_id = str(uuid4())
-        video_batches = pack_video_plan_items(selected_items)
+        video_batches = pack_video_plan_items(selected_items, request_seconds)
         with connect(database_path) as connection:
             for items in video_batches:
                 now = utc_now()
@@ -4060,21 +4589,22 @@ def create_app(
                     """
                     INSERT INTO video_generation_jobs (
                         id, project_id, batch_id, plan_item_id, title, prompt,
-                        seconds, aspect_ratio, reference_assets, model, status,
+                        seconds, aspect_ratio, reference_assets, model, backend, status,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                     """,
                     (
                         str(uuid4()),
                         project_id,
                         batch_id,
                         "+".join(item.id for item in items),
-                        f"第 {first_item.episodeNumber} 集 · 镜头组 {group_label}（30秒）",
-                        build_video_batch_prompt(items),
-                        VIDEO_REQUEST_SECONDS,
+                        f"第 {first_item.episodeNumber} 集 · 镜头组 {group_label}（{request_seconds}秒）",
+                        build_video_batch_prompt(items, request_seconds, model_name),
+                        request_seconds,
                         first_item.aspectRatio,
                         json.dumps(references, ensure_ascii=False),
-                        settings.model,
+                        model_name,
+                        backend.activeBackend,
                         now,
                         now,
                     ),

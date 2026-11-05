@@ -89,6 +89,25 @@ export interface VideoModelSettings {
   updatedAt: string | null;
 }
 
+export interface ComfyUIVideoSettings {
+  provider: "comfyui-h3";
+  baseUrl: string;
+  model: "MiniMax H3";
+  workflowName: string;
+  workflowJson: string;
+  workflowConfigured: boolean;
+  configured: boolean;
+  updatedAt: string | null;
+}
+
+export interface VideoBackendSettings {
+  activeBackend: "api" | "comfyui";
+  configured: boolean;
+  apiConfigured: boolean;
+  comfyuiConfigured: boolean;
+  updatedAt: string | null;
+}
+
 export interface ScriptCharacter {
   name: string;
   identity: string;

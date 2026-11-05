@@ -105,6 +105,173 @@ def test_video_plan_items_pack_into_thirty_second_requests() -> None:
     padded_prompt = build_video_batch_prompt([item(1, 15)])
     assert "【00-15秒｜第1集·镜头组1】" in padded_prompt
     assert "【15-30秒｜自然收束】" in padded_prompt
+    h3_batches = pack_video_plan_items(
+        [item(1, 15), item(2, 15)], request_seconds=15
+    )
+    assert [[part.id for part in batch] for batch in h3_batches] == [
+        ["e1-g1"],
+        ["e1-g2"],
+    ]
+    h3_prompt = build_video_batch_prompt(
+        [item(1, 15)], request_seconds=15, model_name="MiniMax H3"
+    )
+    assert "【任务参数】MiniMax H3，15秒" in h3_prompt
+    assert "15-30秒" not in h3_prompt
+
+
+def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) -> None:
+    credentials = MemoryCredentialStore()
+    prompt_requests: list[dict] = []
+
+    def comfyui_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {"comfyui_version": "0.30.0"}})
+        if request.url.path == "/upload/image":
+            assert b"mock-reference" in request.content
+            return httpx.Response(
+                200,
+                json={"name": "mingyan-reference.png", "subfolder": "", "type": "input"},
+            )
+        if request.url.path == "/prompt":
+            payload = json.loads(request.content)
+            prompt_requests.append(payload)
+            workflow = payload["prompt"]
+            assert workflow["1"]["inputs"]["text"] == "H3 测试提示词"
+            assert workflow["1"]["inputs"]["seconds"] == 15
+            assert workflow["1"]["inputs"]["width"] == 1280
+            assert workflow["2"]["inputs"]["image"] == "mingyan-reference.png"
+            return httpx.Response(200, json={"prompt_id": "h3-task-1"})
+        if request.url.path == "/history/h3-task-1":
+            return httpx.Response(
+                200,
+                json={
+                    "h3-task-1": {
+                        "status": {"completed": True, "status_str": "success"},
+                        "outputs": {
+                            "3": {
+                                "gifs": [
+                                    {
+                                        "filename": "h3-output.mp4",
+                                        "subfolder": "",
+                                        "type": "output",
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                },
+            )
+        if request.url.path == "/view":
+            assert request.url.params["filename"] == "h3-output.mp4"
+            return httpx.Response(
+                200,
+                content=b"mock-h3-mp4",
+                headers={"content-type": "video/mp4"},
+            )
+        return httpx.Response(404)
+
+    workflow = {
+        "1": {
+            "class_type": "H3Prompt",
+            "inputs": {
+                "text": "{{prompt}}",
+                "seconds": "{{seconds}}",
+                "width": "{{width}}",
+                "height": "{{height}}",
+                "seed": "{{seed}}",
+            },
+        },
+        "2": {
+            "class_type": "LoadImage",
+            "inputs": {"image": "{{reference_1}}"},
+        },
+        "3": {"class_type": "SaveVideo", "inputs": {"filename_prefix": "h3"}},
+    }
+    with TestClient(
+        create_app(
+            data_dir=tmp_path,
+            static_dir=Path("missing"),
+            credential_store=credentials,
+            model_transport=httpx.MockTransport(comfyui_handler),
+        )
+    ) as client:
+        saved = client.put(
+            "/api/settings/comfyui-video",
+            json={
+                "baseUrl": "https://h3.example.com/",
+                "workflowName": "H3 15秒测试工作流",
+                "workflowJson": json.dumps(workflow),
+            },
+        )
+        assert saved.status_code == 200
+        assert saved.json()["configured"] is True
+        assert saved.json()["workflowConfigured"] is True
+        tested = client.post("/api/settings/comfyui-video/test")
+        assert tested.status_code == 200
+        assert tested.json()["model"] == "MiniMax H3"
+        selected = client.put(
+            "/api/settings/video-backend", json={"activeBackend": "comfyui"}
+        )
+        assert selected.status_code == 200
+        assert selected.json()["configured"] is True
+
+        project = client.post(
+            "/api/projects", json={"name": "H3测试", "description": ""}
+        ).json()
+        asset_id = "11111111-1111-4111-8111-111111111111"
+        image_id = "22222222-2222-4222-8222-222222222222"
+        image_dir = tmp_path / "generated" / project["id"] / asset_id
+        image_dir.mkdir(parents=True)
+        (image_dir / f"{image_id}.png").write_bytes(b"mock-reference")
+        job_id = "33333333-3333-4333-8333-333333333333"
+        now = "2026-11-05T00:00:00+00:00"
+        with sqlite3.connect(tmp_path / "mingyan.sqlite3") as connection:
+            connection.execute(
+                """
+                INSERT INTO video_generation_jobs (
+                    id, project_id, batch_id, plan_item_id, title, prompt,
+                    seconds, aspect_ratio, reference_assets, model, backend,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'interrupted', ?, ?)
+                """,
+                (
+                    job_id,
+                    project["id"],
+                    "h3-batch",
+                    "e1-g1",
+                    "H3测试视频",
+                    "H3 测试提示词",
+                    15,
+                    "16:9",
+                    json.dumps(
+                        [
+                            {
+                                "logicalId": "asset:image",
+                                "assetId": asset_id,
+                                "imageId": image_id,
+                                "name": "测试角色",
+                                "role": "state",
+                                "itemIds": ["e1-g1"],
+                            }
+                        ]
+                    ),
+                    "MiniMax H3",
+                    "comfyui",
+                    now,
+                    now,
+                ),
+            )
+
+        resumed = client.post(f"/api/projects/{project['id']}/tasks/resume")
+        assert resumed.status_code == 200
+        tasks = client.get(f"/api/projects/{project['id']}/tasks").json()
+        completed = next(task for task in tasks if task["id"] == job_id)
+        assert completed["status"] == "completed"
+        assert completed["providerTaskId"] == "h3-task-1"
+        video = client.get(completed["resultUrl"])
+        assert video.status_code == 200
+        assert video.content == b"mock-h3-mp4"
+        assert len(prompt_requests) == 1
 
 
 def test_temporary_asset_gateway_only_serves_whitelisted_files(tmp_path: Path) -> None:

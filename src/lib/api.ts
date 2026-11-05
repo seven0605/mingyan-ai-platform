@@ -2,6 +2,7 @@ import type {
   AssetTunnelStatus,
   AssetBatchPlan,
   AssetLibrary,
+  ComfyUIVideoSettings,
   ImageModelSettings,
   Project,
   ProjectStage,
@@ -17,6 +18,7 @@ import type {
   TextModelConnection,
   TextModelSettings,
   VideoModelSettings,
+  VideoBackendSettings,
   VideoProductionPlan,
 } from "../types";
 
@@ -141,6 +143,38 @@ export function saveVideoModelSettings(input: {
 export function testVideoModelConnection() {
   return request<TextModelConnection>("/api/settings/video-model/test", {
     method: "POST",
+  });
+}
+
+export function getComfyUIVideoSettings() {
+  return request<ComfyUIVideoSettings>("/api/settings/comfyui-video");
+}
+
+export function saveComfyUIVideoSettings(input: {
+  baseUrl: string;
+  workflowName: string;
+  workflowJson: string;
+}) {
+  return request<ComfyUIVideoSettings>("/api/settings/comfyui-video", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function testComfyUIVideoConnection() {
+  return request<TextModelConnection>("/api/settings/comfyui-video/test", {
+    method: "POST",
+  });
+}
+
+export function getVideoBackendSettings() {
+  return request<VideoBackendSettings>("/api/settings/video-backend");
+}
+
+export function saveVideoBackend(activeBackend: "api" | "comfyui") {
+  return request<VideoBackendSettings>("/api/settings/video-backend", {
+    method: "PUT",
+    body: JSON.stringify({ activeBackend }),
   });
 }
 

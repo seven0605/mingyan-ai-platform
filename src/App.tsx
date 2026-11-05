@@ -11,11 +11,19 @@ import { TopBar } from "./components/TopBar";
 import { VideoWorkspace } from "./components/VideoWorkspace";
 import { Workspace } from "./components/Workspace";
 import { useProjects } from "./hooks/useProjects";
-import { getImageModelSettings, getTextModelSettings, getVideoModelSettings } from "./lib/api";
+import {
+  getComfyUIVideoSettings,
+  getImageModelSettings,
+  getTextModelSettings,
+  getVideoBackendSettings,
+  getVideoModelSettings,
+} from "./lib/api";
 import type {
+  ComfyUIVideoSettings,
   ImageModelSettings,
   PageId,
   TextModelSettings,
+  VideoBackendSettings,
   VideoModelSettings,
 } from "./types";
 
@@ -37,6 +45,8 @@ export default function App() {
   const [textModelSettings, setTextModelSettings] = useState<TextModelSettings | null>(null);
   const [imageModelSettings, setImageModelSettings] = useState<ImageModelSettings | null>(null);
   const [videoModelSettings, setVideoModelSettings] = useState<VideoModelSettings | null>(null);
+  const [comfyUIVideoSettings, setComfyUIVideoSettings] = useState<ComfyUIVideoSettings | null>(null);
+  const [videoBackendSettings, setVideoBackendSettings] = useState<VideoBackendSettings | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const {
     projects,
@@ -50,12 +60,20 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    Promise.all([getTextModelSettings(), getImageModelSettings(), getVideoModelSettings()])
-      .then(([textSettings, imageSettings, videoSettings]) => {
+    Promise.all([
+      getTextModelSettings(),
+      getImageModelSettings(),
+      getVideoModelSettings(),
+      getComfyUIVideoSettings(),
+      getVideoBackendSettings(),
+    ])
+      .then(([textSettings, imageSettings, videoSettings, comfySettings, backendSettings]) => {
         if (!active) return;
         setTextModelSettings(textSettings);
         setImageModelSettings(imageSettings);
         setVideoModelSettings(videoSettings);
+        setComfyUIVideoSettings(comfySettings);
+        setVideoBackendSettings(backendSettings);
       })
       .catch((settingsLoadError: unknown) => {
         if (!active) return;
@@ -87,7 +105,7 @@ export default function App() {
             onOpenTasks={() => setActivePage("tasks")}
             textModelConfigured={textModelSettings?.configured ?? false}
             imageModelConfigured={imageModelSettings?.configured ?? false}
-            videoModelConfigured={videoModelSettings?.configured ?? false}
+            videoModelConfigured={videoBackendSettings?.configured ?? false}
           />
         ) : activePage === "source" ? (
           <SourceEditor
@@ -104,6 +122,8 @@ export default function App() {
             textSettings={textModelSettings}
             imageSettings={imageModelSettings}
             videoSettings={videoModelSettings}
+            comfyUIVideoSettings={comfyUIVideoSettings}
+            videoBackendSettings={videoBackendSettings}
             loadError={settingsError}
             onTextSettingsChange={(settings) => {
               setTextModelSettings(settings);
@@ -115,6 +135,24 @@ export default function App() {
             }}
             onVideoSettingsChange={(settings) => {
               setVideoModelSettings(settings);
+              setVideoBackendSettings((current) => current ? {
+                ...current,
+                apiConfigured: settings.configured,
+                configured: current.activeBackend === "api" ? settings.configured : current.configured,
+              } : current);
+              setSettingsError(null);
+            }}
+            onComfyUIVideoSettingsChange={(settings) => {
+              setComfyUIVideoSettings(settings);
+              setVideoBackendSettings((current) => current ? {
+                ...current,
+                comfyuiConfigured: settings.configured,
+                configured: current.activeBackend === "comfyui" ? settings.configured : current.configured,
+              } : current);
+              setSettingsError(null);
+            }}
+            onVideoBackendSettingsChange={(settings) => {
+              setVideoBackendSettings(settings);
               setSettingsError(null);
             }}
           />
@@ -141,7 +179,7 @@ export default function App() {
             onOpenApiSettings={() => setActivePage("api")}
             onOpenTasks={() => setActivePage("tasks")}
             onPlanReady={() => updateStage("video")}
-            videoModelConfigured={videoModelSettings?.configured ?? false}
+            videoModelConfigured={videoBackendSettings?.configured ?? false}
           />
         ) : activePage === "tasks" ? (
           <TaskCenter
