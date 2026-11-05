@@ -12,6 +12,7 @@ from server.app import (
     build_video_batch_prompt,
     comfyui_history_error,
     create_app,
+    extract_h3_literal_locks,
     fit_h3_references,
     is_collective_character,
     pack_video_plan_items,
@@ -189,6 +190,20 @@ def test_h3_continuity_override_makes_picture_pixels_authoritative() -> None:
     assert "without a hold, freeze, reset" in continued
     assert "[Shot 1] The subject raises her arm." not in continued
     assert apply_h3_continuity_override(prompt, False) == prompt
+
+
+def test_h3_literal_locks_keep_exact_outfit_wording() -> None:
+    locks = extract_h3_literal_locks(
+        [
+            "【关键锁定】\n- 云子姝：粉桃短袄、浅青马面裙；禁止换装。\n"
+            "- 萧云衡：淡藕灰锦袍；禁止换装或伤痕消失。",
+            "- 云子姝：粉桃短袄、浅青马面裙；禁止换装。",
+        ]
+    )
+    assert locks == [
+        "云子姝：粉桃短袄、浅青马面裙；禁止换装。",
+        "萧云衡：淡藕灰锦袍；禁止换装或伤痕消失。",
+    ]
 
 
 def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) -> None:

@@ -777,6 +777,17 @@ def apply_h3_continuity_override(content: str, enabled: bool) -> str:
     return content.replace("[Shot 1]", instruction, 1)
 
 
+def extract_h3_literal_locks(prompts: list[str]) -> list[str]:
+    locks: list[str] = []
+    for prompt in prompts:
+        for lock in re.findall(
+            r"(?m)^-\s*([^\n]*(?:禁止换装|禁止袍色变化)[^\n]*)$", prompt
+        ):
+            if lock not in locks:
+                locks.append(lock)
+    return locks
+
+
 def connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -2038,6 +2049,8 @@ def create_app(
             f"{item.purpose}\n{item.prompt}"
             for item in items
         )
+        literal_locks = extract_h3_literal_locks([item.prompt for item in items])
+        literal_lock_block = "\n".join(literal_locks)
         system_prompt = """
 You are a MiniMax H3 Ref2VA prompt compiler. Return only one production prompt in
 the exact six-section order below, with the section labels written exactly as shown:
@@ -2051,6 +2064,10 @@ dialogue. Use <Subject N> for reusable visible content and cite the supplied
 <Picture N> numbers exactly. The summary must begin with the task prefix supplied
 in the user request.
 Use fully_preserved or partially_preserved markers in retention_analysis.
+If an IMMUTABLE IDENTITY AND WARDROBE CONTRACT is supplied, copy its literal Chinese
+lines into subject_definitions without translating, shortening, synonymizing, or
+changing colors, materials, injuries, hair, or accessories. Those lines override
+all conflicting visual prose in the source timeline.
 
 The target is exactly 15 seconds unless another duration is explicitly supplied.
 Write 350-500 English words in detailed_description. [Shot 1] has no timestamp;
@@ -2090,6 +2107,12 @@ after that continuous movement may the next requested action begin.
             + continuity_instruction
             + "REFERENCE ORDER\n"
             + "\n".join(reference_lines)
+            + (
+                "\n\nIMMUTABLE IDENTITY AND WARDROBE CONTRACT\n"
+                + literal_lock_block
+                if literal_lock_block
+                else ""
+            )
             + "\n\nSOURCE TIMELINE\n"
             + source_timeline
         )
@@ -2140,6 +2163,12 @@ after that continuous movement may the next requested action begin.
         positions = [content.find(section) for section in required_sections]
         if any(position < 0 for position in positions) or positions != sorted(positions):
             raise HTTPException(status_code=502, detail="H3 提示词缺少官方六段结构")
+        if literal_lock_block:
+            content = content.replace(
+                "summary:",
+                f"IMMUTABLE IDENTITY AND WARDROBE CONTRACT:\n{literal_lock_block}\nsummary:",
+                1,
+            )
         return apply_h3_continuity_override(content, has_continuity)
 
     def image_model_settings() -> ImageModelSettingsOut:
