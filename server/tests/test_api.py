@@ -17,6 +17,7 @@ from server.app import (
     pack_video_plan_items,
 )
 from server.asset_tunnel import AssetTunnelStatus, TemporaryAssetTunnel
+from server.storyboard_generation import build_storyboard_messages
 
 
 class MemoryCredentialStore:
@@ -71,6 +72,21 @@ class FakeAssetTunnel:
 
     def served_request_count(self) -> int:
         return 1
+
+
+def test_storyboard_prompt_contains_live_action_v5_rules() -> None:
+    messages = build_storyboard_messages(
+        {"episodeNumber": 2},
+        [{"index": 1}],
+        "MiniMax H3",
+        "16:9",
+        24,
+    )
+    system_prompt = messages[0]["content"]
+    assert "5—7个微镜头" in system_prompt
+    assert "FACS可见动作" in system_prompt
+    assert "同一角色的服装描述跨组必须逐字一致" in system_prompt
+    assert "无背景音乐、无BGM、无配乐" in system_prompt
 
 
 def test_collective_characters_use_widescreen() -> None:
@@ -170,6 +186,7 @@ def test_h3_continuity_override_makes_picture_pixels_authoritative() -> None:
     prompt = "detailed_description:\n[Shot 1] The subject raises her arm."
     continued = apply_h3_continuity_override(prompt, True)
     assert "literal pixels of <Picture 1>" in continued
+    assert "without a hold, freeze, reset" in continued
     assert "[Shot 1] The subject raises her arm." not in continued
     assert apply_h3_continuity_override(prompt, False) == prompt
 

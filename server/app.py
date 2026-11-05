@@ -769,9 +769,9 @@ def apply_h3_continuity_override(content: str, enabled: bool) -> str:
         return content
     instruction = (
         "[Shot 1] [First-frame authority] Use the literal pixels of <Picture 1> as "
-        "frame zero. For the first 0.4 seconds, preserve its actual camera, people, "
-        "poses, props, lighting, and axis and continue only the motion visibly implied "
-        "by those pixels. Any following textual claim about the opening image is "
+        "frame zero. Continue the motion visibly implied by those pixels immediately, "
+        "without a hold, freeze, reset, repeated action, pose restaging, camera-axis "
+        "change, or lighting jump. Any following textual claim about the opening image is "
         "non-authoritative when it conflicts with <Picture 1>."
     )
     return content.replace("[Shot 1]", instruction, 1)
@@ -2065,9 +2065,10 @@ new characters, events, props, or dialogue. No Markdown fences and no commentary
 When <Picture 1> is an exact first-frame anchor, you cannot inspect its pixels.
 Never claim it shows a particular person, pose, prop, framing, or action unless that
 fact is independently guaranteed by the source. In [Shot 1], state that the video
-opens on the exact pixels of <Picture 1>; preserve them for the opening instant and
-continue the visible motion generically for 0.3-0.5 seconds. The picture overrides
-any conflicting source description. Only then stage the next requested action.
+opens on the exact pixels of <Picture 1> and immediately continues the visible motion
+without a hold, freeze, reset, repeated action, pose restaging, camera-axis change,
+or lighting jump. The picture overrides any conflicting source description. Only
+after that continuous movement may the next requested action begin.
 """.strip()
         summary_prefix = (
             "[keyframe completion + reference generation]"
@@ -2075,9 +2076,10 @@ any conflicting source description. Only then stage the next requested action.
             else "[reference generation]"
         )
         continuity_instruction = (
-            "Begin [Shot 1] exactly from <Picture 1>. For the first 0.3-0.5 seconds, "
-            "continue the prior motion from the preserved pose and direction without "
-            "a reset, teleport, repeated action, camera-axis change, or lighting jump.\n\n"
+            "Begin [Shot 1] exactly from <Picture 1> and continue the prior motion "
+            "immediately from the preserved pose and direction without a hold, freeze, "
+            "reset, teleport, repeated action, pose restaging, camera-axis change, or "
+            "lighting jump.\n\n"
             if has_continuity
             else ""
         )
@@ -4387,8 +4389,8 @@ any conflicting source description. Only then stage the next requested action.
         continuity_notes: list[str] = []
         style_bible = ""
         episode_title = episode.title
-        for batch_start in range(0, len(blueprints), 2):
-            batch = blueprints[batch_start : batch_start + 2]
+        for batch_start in range(0, len(blueprints)):
+            batch = blueprints[batch_start : batch_start + 1]
             continuity_context = ""
             if generated_groups:
                 previous = generated_groups[-1]
@@ -4904,22 +4906,38 @@ any conflicting source description. Only then stage the next requested action.
                             item_ids.append(item.id)
                 references = list(references_by_id.values())
                 first_item = items[0]
-                if backend.activeBackend == "comfyui" and first_item.groupIndex > 1:
-                    previous_plan_item_id = (
-                        f"e{first_item.episodeNumber}-g{first_item.groupIndex - 1}"
-                    )
-                    previous_job = connection.execute(
-                        """
-                        SELECT id FROM video_generation_jobs
-                        WHERE project_id = ? AND plan_item_id = ? AND status = 'completed'
-                        ORDER BY updated_at DESC LIMIT 1
-                        """,
-                        (project_id, previous_plan_item_id),
-                    ).fetchone()
+                if backend.activeBackend == "comfyui" and (
+                    first_item.groupIndex > 1 or first_item.episodeNumber > 1
+                ):
+                    if first_item.groupIndex > 1:
+                        previous_plan_item_id = (
+                            f"e{first_item.episodeNumber}-g{first_item.groupIndex - 1}"
+                        )
+                        previous_job = connection.execute(
+                            """
+                            SELECT id, plan_item_id FROM video_generation_jobs
+                            WHERE project_id = ? AND plan_item_id = ? AND status = 'completed'
+                            ORDER BY updated_at DESC LIMIT 1
+                            """,
+                            (project_id, previous_plan_item_id),
+                        ).fetchone()
+                    else:
+                        previous_episode_prefix = f"e{first_item.episodeNumber - 1}-g"
+                        previous_job = connection.execute(
+                            """
+                            SELECT id, plan_item_id FROM video_generation_jobs
+                            WHERE project_id = ? AND plan_item_id LIKE ? AND status = 'completed'
+                            ORDER BY CAST(SUBSTR(plan_item_id, INSTR(plan_item_id, '-g') + 2)
+                                          AS INTEGER) DESC,
+                                     updated_at DESC
+                            LIMIT 1
+                            """,
+                            (project_id, f"{previous_episode_prefix}%"),
+                        ).fetchone()
                     if previous_job is None:
                         raise HTTPException(
                             status_code=409,
-                            detail="请先完成并验收上一镜头组，再生成当前 H3 视频",
+                            detail="请先完成并验收上一镜头组或上一集末镜头组，再生成当前 H3 视频",
                         )
                     video_dir = resolved_data_dir / "generated" / project_id / "videos"
                     previous_frame = video_dir / f"{previous_job['id']}-last-frame.png"
@@ -4938,7 +4956,11 @@ any conflicting source description. Only then stage the next requested action.
                             "logicalId": f"continuity:{previous_job['id']}",
                             "assetId": "",
                             "imageId": previous_job["id"],
-                            "name": f"上一镜头组 {first_item.groupIndex - 1} 稳定终帧",
+                            "name": (
+                                f"上一镜头组 {first_item.groupIndex - 1} 稳定终帧"
+                                if first_item.groupIndex > 1
+                                else f"上一集末镜头组 {previous_job['plan_item_id']} 稳定终帧"
+                            ),
                             "role": "continuity",
                             "sourceJobId": previous_job["id"],
                             "itemIds": [item.id for item in items],
