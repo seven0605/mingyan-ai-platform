@@ -16,6 +16,7 @@ from server.app import (
     extract_h3_literal_locks,
     fit_h3_references,
     h3_authoritative_source,
+    h3_dialogue_chunks_valid,
     h3_shot_density_valid,
     is_collective_character,
     pack_video_plan_items,
@@ -241,6 +242,13 @@ def test_h3_shot_density_requires_five_to_seven_shots_for_fifteen_seconds() -> N
     five_shots = "\n".join(f"[Shot {index}]" for index in range(1, 6))
     assert h3_shot_density_valid(five_shots, 15)
     assert not h3_shot_density_valid("[Shot 1]\n[Shot 2]\n[Shot 3]", 15)
+
+
+def test_h3_dialogue_chunks_limit_long_chinese_lines() -> None:
+    assert h3_dialogue_chunks_valid("(S1) <d>短句对白。</d>")
+    assert not h3_dialogue_chunks_valid(
+        "(S1) <d>这是一句明显超过四秒而且没有拆分到反应镜头里的中文长对白内容。</d>"
+    )
 
 
 def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) -> None:
