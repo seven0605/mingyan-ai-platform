@@ -792,12 +792,12 @@ def extract_h3_literal_locks(prompts: list[str]) -> list[str]:
 
 def enforce_h3_axis_continuity(content: str) -> str:
     content = re.sub(
-        r"(?i)(?:cuts?|cutting|moving|rotating|shifting) across the 180-degree axis(?: line)?",
+        r"(?i)(?:cuts?|cutting|moving|rotating|shifting) across the 180-degree(?: axis)?(?: line)?",
         "remaining on the original side of the 180-degree axis and shifting",
         content,
     )
     return re.sub(
-        r"(?i)crossing the 180-degree axis(?: line)?",
+        r"(?i)crossing the 180-degree(?: axis)?(?: line)?",
         "preserving the original side of the 180-degree axis",
         content,
     )
@@ -2122,7 +2122,10 @@ opens on the exact pixels of <Picture 1> and immediately continues the visible m
 in the same shot for 0.8-1.0 seconds. Never use a one-frame flash or cut away before
 0.8 seconds. Do not hold, freeze, reset, repeat an action, restage a pose, change the
 camera axis, or jump the lighting. The picture overrides any conflicting source
-description. Only after that continuous movement may the next requested action begin.
+description. Dedicate [Shot 1] only to this 0.8-1.0 second continuity bridge. Begin
+the first new requested action at [Shot 2] after 0.8-1.0 seconds with an explicit
+cut that preserves the axis. Never blend, morph, or teleport from the anchor image
+into the next action inside [Shot 1].
 """.strip()
         summary_prefix = (
             "[keyframe completion + reference generation]"
