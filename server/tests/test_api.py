@@ -7,9 +7,12 @@ from fastapi.testclient import TestClient
 
 from server.app import (
     VideoProductionPlanItem,
+    apply_h3_continuity_override,
     asset_aspect_ratio,
     build_video_batch_prompt,
+    comfyui_history_error,
     create_app,
+    fit_h3_references,
     is_collective_character,
     pack_video_plan_items,
 )
@@ -117,6 +120,58 @@ def test_video_plan_items_pack_into_thirty_second_requests() -> None:
     )
     assert "【任务参数】MiniMax H3，15秒" in h3_prompt
     assert "15-30秒" not in h3_prompt
+
+
+def test_h3_reference_slots_prioritize_distinct_state_images_and_pad() -> None:
+    references = [
+        {"logicalId": "identity:a", "role": "identity", "name": "甲"},
+        {"logicalId": "state:a", "role": "state", "name": "甲"},
+        {"logicalId": "identity:b", "role": "identity", "name": "乙"},
+        {"logicalId": "state:b", "role": "state", "name": "乙"},
+        {"logicalId": "state:c", "role": "state", "name": "场景"},
+    ]
+    selected = fit_h3_references(references, 4)
+    assert [item["logicalId"] for item in selected] == [
+        "state:a",
+        "state:b",
+        "state:c",
+        "identity:a",
+    ]
+    padded = fit_h3_references([references[1]], 2)
+    assert padded[0]["logicalId"] == "state:a"
+    assert padded[1]["logicalId"] == "state:a:repeat-2"
+    prioritized = fit_h3_references(references, 2, "乙走向场景")
+    assert [item["logicalId"] for item in prioritized] == ["state:b", "state:c"]
+    continuity = {"logicalId": "continuity:g1", "role": "continuity", "name": "终帧"}
+    continued = fit_h3_references([*references, continuity], 4)
+    assert [item["logicalId"] for item in continued] == [
+        "continuity:g1",
+        "state:a",
+        "state:b",
+        "state:c",
+    ]
+
+
+def test_comfyui_history_error_detects_failed_incomplete_job() -> None:
+    status = {
+        "status_str": "error",
+        "completed": False,
+        "messages": [
+            [
+                "execution_error",
+                {"exception_message": "Allocation failed: out of memory\ntraceback"},
+            ]
+        ],
+    }
+    assert comfyui_history_error(status) == "H3 工作流执行失败：云端 GPU 显存不足"
+
+
+def test_h3_continuity_override_makes_picture_pixels_authoritative() -> None:
+    prompt = "detailed_description:\n[Shot 1] The subject raises her arm."
+    continued = apply_h3_continuity_override(prompt, True)
+    assert "literal pixels of <Picture 1>" in continued
+    assert "[Shot 1] The subject raises her arm." not in continued
+    assert apply_h3_continuity_override(prompt, False) == prompt
 
 
 def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) -> None:

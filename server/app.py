@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
+import imageio_ffmpeg
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from keyring.errors import KeyringError
@@ -739,6 +741,42 @@ def comfyui_video_output(history_item: dict) -> dict[str, str] | None:
     return None
 
 
+def comfyui_history_error(status: object) -> str:
+    if not isinstance(status, dict):
+        return ""
+    status_text = str(status.get("status_str") or "").lower()
+    messages = status.get("messages")
+    detail = ""
+    if isinstance(messages, list):
+        for message in messages:
+            if (
+                isinstance(message, list)
+                and len(message) > 1
+                and message[0] == "execution_error"
+                and isinstance(message[1], dict)
+            ):
+                detail = str(message[1].get("exception_message") or "").splitlines()[0]
+                break
+    if status_text not in {"error", "failed"} and not detail:
+        return ""
+    if "out of memory" in detail.lower():
+        return "H3 工作流执行失败：云端 GPU 显存不足"
+    return f"H3 工作流执行失败：{detail[:240]}" if detail else "H3 工作流执行失败"
+
+
+def apply_h3_continuity_override(content: str, enabled: bool) -> str:
+    if not enabled:
+        return content
+    instruction = (
+        "[Shot 1] [First-frame authority] Use the literal pixels of <Picture 1> as "
+        "frame zero. For the first 0.4 seconds, preserve its actual camera, people, "
+        "poses, props, lighting, and axis and continue only the motion visibly implied "
+        "by those pixels. Any following textual claim about the opening image is "
+        "non-authoritative when it conflicts with <Picture 1>."
+    )
+    return content.replace("[Shot 1]", instruction, 1)
+
+
 def connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -1365,6 +1403,80 @@ def build_video_batch_prompt(
     return "\n\n".join(sections)
 
 
+def fit_h3_references(
+    references: list[dict[str, object]],
+    required_count: int,
+    priority_text: str = "",
+) -> list[dict[str, object]]:
+    if required_count <= 0:
+        return []
+    continuity = [
+        reference for reference in references if reference.get("role") == "continuity"
+    ]
+    states = [reference for reference in references if reference.get("role") == "state"]
+    state_order = {
+        str(reference.get("logicalId")): index
+        for index, reference in enumerate(states)
+    }
+    states.sort(
+        key=lambda reference: (
+            (
+                priority_text.find(str(reference.get("name") or ""))
+                if str(reference.get("name") or "") in priority_text
+                else len(priority_text) + state_order[str(reference.get("logicalId"))]
+            ),
+            state_order[str(reference.get("logicalId"))],
+        )
+    )
+    identities = [
+        reference for reference in references if reference.get("role") == "identity"
+    ]
+    selected = [
+        dict(reference)
+        for reference in [*continuity, *states, *identities][:required_count]
+    ]
+    if not selected:
+        return []
+    while len(selected) < required_count:
+        repeated = dict(selected[-1])
+        repeated["logicalId"] = f"{repeated['logicalId']}:repeat-{len(selected) + 1}"
+        selected.append(repeated)
+    return selected
+
+
+def extract_video_terminal_frame(video_path: Path, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f".{output_path.stem}.tmp.png")
+    try:
+        completed = subprocess.run(
+            [
+                imageio_ffmpeg.get_ffmpeg_exe(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-sseof",
+                "-0.25",
+                "-i",
+                str(video_path),
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-y",
+                str(temporary_path),
+            ],
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError("无法读取上一条视频的稳定终帧") from error
+    if completed.returncode != 0 or not temporary_path.is_file():
+        detail = completed.stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"无法提取视频终帧：{detail or 'ffmpeg 未生成图片'}")
+    temporary_path.replace(output_path)
+
+
 def validate_asset_library(payload: AssetLibraryPayload) -> None:
     if not payload.items:
         raise ValueError("资产库不能为空")
@@ -1885,6 +1997,148 @@ def create_app(
         if not api_key:
             raise HTTPException(status_code=409, detail="系统凭据库中没有找到 API 密钥")
         return settings, api_key
+
+    def generate_h3_reference_prompt(
+        items: list[VideoProductionPlanItem],
+        references: list[dict[str, object]],
+        seconds: int,
+    ) -> str:
+        settings, api_key = text_model_credentials()
+        chat_url = (
+            f"{settings.baseUrl}/chat/completions"
+            if settings.baseUrl.endswith("/v1")
+            else f"{settings.baseUrl}/v1/chat/completions"
+        )
+        reference_lines = []
+        has_continuity = any(
+            reference.get("role") == "continuity" for reference in references[:4]
+        )
+        for index, reference in enumerate(references[:4], start=1):
+            if reference.get("role") == "continuity":
+                reference_lines.append(
+                    f"<Picture {index}>: {reference['name']} is the exact first-frame "
+                    "composition anchor. Preserve every visible position, facing direction, "
+                    "pose, prop, lighting direction, camera axis, and action state. Its pixels "
+                    "are authoritative but unavailable to the text compiler, so do not invent "
+                    "or assert unverified visual details about this picture."
+                )
+            else:
+                role = (
+                    "identity master"
+                    if reference.get("role") == "identity"
+                    else "visual state"
+                )
+                reference_lines.append(
+                    f"<Picture {index}>: {reference['name']} ({role}); preserve this asset's "
+                    "identity, production design, costume, material, and visible state."
+                )
+        source_timeline = "\n\n".join(
+            f"Target 00:00.000-00:{item.durationSeconds:06.3f}, Episode "
+            f"{item.episodeNumber}, shot group {item.groupIndex}, purpose: "
+            f"{item.purpose}\n{item.prompt}"
+            for item in items
+        )
+        system_prompt = """
+You are a MiniMax H3 Ref2VA prompt compiler. Return only one production prompt in
+the exact six-section order below, with the section labels written exactly as shown:
+subject_definitions:, summary:, retention_analysis:, detailed_description:,
+overall_soundscape:, non_diegetic_music:.
+
+Write all six sections in English. Preserve Chinese only for spoken dialogue and
+visible text. Put every spoken line inside <d>[Chinese] ...</d>, assign stable (S1),
+(S2) speaker IDs in order of first vocal event, and never translate or paraphrase the
+dialogue. Use <Subject N> for reusable visible content and cite the supplied
+<Picture N> numbers exactly. The summary must begin with the task prefix supplied
+in the user request.
+Use fully_preserved or partially_preserved markers in retention_analysis.
+
+The target is exactly 15 seconds unless another duration is explicitly supplied.
+Write 350-500 English words in detailed_description. [Shot 1] has no timestamp;
+every later shot begins with [Shot N] At MM:SS.mmm. Each cut must change camera
+angle by at least 30 degrees and skip at least one shot-size rung while preserving
+the 180-degree axis. If a requested cut would violate this, insert a reaction,
+object, or environmental cutaway. Describe composition, positions, appearance,
+lighting, physical actions and state changes, camera movement, sound, and the exact
+moment each reference takes effect. Keep actions physically plausible. Do not add
+new characters, events, props, or dialogue. No Markdown fences and no commentary.
+
+When <Picture 1> is an exact first-frame anchor, you cannot inspect its pixels.
+Never claim it shows a particular person, pose, prop, framing, or action unless that
+fact is independently guaranteed by the source. In [Shot 1], state that the video
+opens on the exact pixels of <Picture 1>; preserve them for the opening instant and
+continue the visible motion generically for 0.3-0.5 seconds. The picture overrides
+any conflicting source description. Only then stage the next requested action.
+""".strip()
+        summary_prefix = (
+            "[keyframe completion + reference generation]"
+            if has_continuity
+            else "[reference generation]"
+        )
+        continuity_instruction = (
+            "Begin [Shot 1] exactly from <Picture 1>. For the first 0.3-0.5 seconds, "
+            "continue the prior motion from the preserved pose and direction without "
+            "a reset, teleport, repeated action, camera-axis change, or lighting jump.\n\n"
+            if has_continuity
+            else ""
+        )
+        user_prompt = (
+            f"Compile a {seconds}-second, 16:9, live-action Ming-dynasty dramatic "
+            f"scene for MiniMax H3 Hybrid FL2VA+Ref2VA. Required summary prefix: "
+            f"{summary_prefix}.\n\n"
+            + continuity_instruction
+            + "REFERENCE ORDER\n"
+            + "\n".join(reference_lines)
+            + "\n\nSOURCE TIMELINE\n"
+            + source_timeline
+        )
+        try:
+            with httpx.Client(
+                transport=model_transport, timeout=240, follow_redirects=True
+            ) as client:
+                response = client.post(
+                    chat_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": settings.model,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 6000,
+                    },
+                )
+        except httpx.RequestError as error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"H3 提示词编译请求失败：{type(error).__name__}",
+            ) from error
+        if not response.is_success:
+            raise HTTPException(
+                status_code=502,
+                detail=f"H3 提示词编译失败（HTTP {response.status_code}）",
+            )
+        try:
+            content = str(response.json()["choices"][0]["message"]["content"]).strip()
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=502, detail="H3 提示词编译结果无法识别") from error
+        if content.startswith("```") and content.endswith("```"):
+            content = re.sub(r"^```(?:text)?\s*|\s*```$", "", content).strip()
+        required_sections = (
+            "subject_definitions:",
+            "summary:",
+            "retention_analysis:",
+            "detailed_description:",
+            "overall_soundscape:",
+            "non_diegetic_music:",
+        )
+        positions = [content.find(section) for section in required_sections]
+        if any(position < 0 for position in positions) or positions != sorted(positions):
+            raise HTTPException(status_code=502, detail="H3 提示词缺少官方六段结构")
+        return apply_h3_continuity_override(content, has_continuity)
 
     def image_model_settings() -> ImageModelSettingsOut:
         with connect(database_path) as connection:
@@ -2428,6 +2682,7 @@ def create_app(
         provider_task_id = job["provider_task_id"]
         recoverable = bool(provider_task_id)
         temporary_path: Path | None = None
+        continuity_warning = ""
         try:
             settings = configured_comfyui_video_settings()
             workflow_template = json.loads(settings.workflowJson)
@@ -2467,6 +2722,16 @@ def create_app(
                             str(reference["assetId"]),
                             str(reference["imageId"]),
                         )
+                    elif reference.get("role") == "continuity":
+                        image_path = (
+                            resolved_data_dir
+                            / "generated"
+                            / job["project_id"]
+                            / "videos"
+                            / f"{reference['sourceJobId']}-last-frame.png"
+                        )
+                        if not image_path.is_file():
+                            image_path = None
                     else:
                         image_path = asset_reference_file_path(
                             job["project_id"],
@@ -2591,11 +2856,12 @@ def create_app(
                         if video_output:
                             break
                         status = history_item.get("status")
+                        history_error = comfyui_history_error(status)
+                        if history_error:
+                            recoverable = False
+                            raise HTTPException(status_code=502, detail=history_error)
                         if isinstance(status, dict) and status.get("completed"):
                             recoverable = False
-                            status_text = json.dumps(status, ensure_ascii=False).lower()
-                            if "error" in status_text:
-                                raise HTTPException(status_code=502, detail="H3 工作流执行失败，请查看 ComfyUI 日志")
                             raise HTTPException(
                                 status_code=502,
                                 detail="H3 工作流已结束，但没有找到 MP4 输出；请检查 SaveVideo 输出节点",
@@ -2624,6 +2890,13 @@ def create_app(
                 temporary_path.write_bytes(downloaded.content)
                 temporary_path.replace(video_path)
                 temporary_path = None
+                try:
+                    extract_video_terminal_frame(
+                        video_path,
+                        video_dir / f"{job['id']}-last-frame.png",
+                    )
+                except RuntimeError as error:
+                    continuity_warning = f"成片已完成，但终帧提取失败：{error}"
 
             now = utc_now()
             result_url = f"/api/projects/{job['project_id']}/videos/{job['id']}/content"
@@ -2632,10 +2905,10 @@ def create_app(
                     """
                     UPDATE video_generation_jobs
                     SET status = 'completed', provider_task_id = ?, result_url = ?,
-                        cost = NULL, error = '', updated_at = ?
+                        cost = NULL, error = ?, updated_at = ?
                     WHERE id = ?
                     """,
-                    (provider_task_id, result_url, now, job["id"]),
+                    (provider_task_id, result_url, continuity_warning, now, job["id"]),
                 )
         except (
             HTTPException,
@@ -4540,6 +4813,7 @@ def create_app(
         project_id: str, background_tasks: BackgroundTasks
     ) -> list[ProjectTaskOut]:
         backend = video_backend_settings()
+        h3_reference_count = 0
         if not backend.configured:
             raise HTTPException(status_code=409, detail="当前视频生成通道尚未配置完整")
         if backend.activeBackend == "api":
@@ -4557,6 +4831,17 @@ def create_app(
             comfy_settings = configured_comfyui_video_settings()
             request_seconds = H3_REQUEST_SECONDS
             model_name = comfy_settings.model
+            workflow_placeholders = comfyui_workflow_placeholders(
+                json.loads(comfy_settings.workflowJson)
+            )
+            h3_reference_count = max(
+                (
+                    int(name.rsplit("_", 1)[-1])
+                    for name in workflow_placeholders
+                    if re.fullmatch(r"reference_[1-9][0-9]*", name)
+                ),
+                default=0,
+            )
         selected_items = selected_video_plan_items(project_id)
         video_reference_files(project_id, selected_items)
         with connect(database_path) as connection:
@@ -4619,6 +4904,53 @@ def create_app(
                             item_ids.append(item.id)
                 references = list(references_by_id.values())
                 first_item = items[0]
+                if backend.activeBackend == "comfyui" and first_item.groupIndex > 1:
+                    previous_plan_item_id = (
+                        f"e{first_item.episodeNumber}-g{first_item.groupIndex - 1}"
+                    )
+                    previous_job = connection.execute(
+                        """
+                        SELECT id FROM video_generation_jobs
+                        WHERE project_id = ? AND plan_item_id = ? AND status = 'completed'
+                        ORDER BY updated_at DESC LIMIT 1
+                        """,
+                        (project_id, previous_plan_item_id),
+                    ).fetchone()
+                    if previous_job is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="请先完成并验收上一镜头组，再生成当前 H3 视频",
+                        )
+                    video_dir = resolved_data_dir / "generated" / project_id / "videos"
+                    previous_frame = video_dir / f"{previous_job['id']}-last-frame.png"
+                    if not previous_frame.is_file():
+                        previous_video = video_dir / f"{previous_job['id']}.mp4"
+                        if previous_video.is_file():
+                            extract_video_terminal_frame(previous_video, previous_frame)
+                    if not previous_frame.is_file():
+                        raise HTTPException(
+                            status_code=409,
+                            detail="上一镜头组缺少稳定终帧，暂不能生成下一条视频",
+                        )
+                    references.insert(
+                        0,
+                        {
+                            "logicalId": f"continuity:{previous_job['id']}",
+                            "assetId": "",
+                            "imageId": previous_job["id"],
+                            "name": f"上一镜头组 {first_item.groupIndex - 1} 稳定终帧",
+                            "role": "continuity",
+                            "sourceJobId": previous_job["id"],
+                            "itemIds": [item.id for item in items],
+                        },
+                    )
+                if backend.activeBackend == "comfyui":
+                    priority_text = "\n".join(
+                        f"{item.purpose}\n{item.prompt}" for item in items
+                    )
+                    references = fit_h3_references(
+                        references, h3_reference_count, priority_text
+                    )
                 last_item = items[-1]
                 group_label = (
                     str(first_item.groupIndex)
@@ -4639,7 +4971,15 @@ def create_app(
                         batch_id,
                         "+".join(item.id for item in items),
                         f"第 {first_item.episodeNumber} 集 · 镜头组 {group_label}（{request_seconds}秒）",
-                        build_video_batch_prompt(items, request_seconds, model_name),
+                        (
+                            generate_h3_reference_prompt(
+                                items, references, request_seconds
+                            )
+                            if backend.activeBackend == "comfyui"
+                            else build_video_batch_prompt(
+                                items, request_seconds, model_name
+                            )
+                        ),
                         request_seconds,
                         first_item.aspectRatio,
                         json.dumps(references, ensure_ascii=False),
