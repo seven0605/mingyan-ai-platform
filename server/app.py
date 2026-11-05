@@ -803,6 +803,14 @@ def enforce_h3_axis_continuity(content: str) -> str:
     )
 
 
+def h3_authoritative_source(prompt: str) -> str:
+    marker = "【模型执行主提示词】"
+    if marker in prompt:
+        return prompt.split(marker, 1)[1].strip()
+    start = prompt.find("[出镜角色-物品-场景]")
+    return prompt[start:].strip() if start >= 0 else prompt.strip()
+
+
 def connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -2061,7 +2069,7 @@ def create_app(
         source_timeline = "\n\n".join(
             f"Target 00:00.000-00:{item.durationSeconds:06.3f}, Episode "
             f"{item.episodeNumber}, shot group {item.groupIndex}, purpose: "
-            f"{item.purpose}\n{item.prompt}"
+            f"{item.purpose}\n{h3_authoritative_source(item.prompt)}"
             for item in items
         )
         literal_locks = extract_h3_literal_locks([item.prompt for item in items])

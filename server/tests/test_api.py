@@ -15,6 +15,7 @@ from server.app import (
     enforce_h3_axis_continuity,
     extract_h3_literal_locks,
     fit_h3_references,
+    h3_authoritative_source,
     is_collective_character,
     pack_video_plan_items,
 )
@@ -217,6 +218,16 @@ def test_h3_axis_continuity_removes_cross_axis_language() -> None:
     assert "across the 180-degree axis" not in fixed
     assert "crossing the 180-degree axis" not in fixed
     assert fixed.count("original side of the 180-degree axis") == 2
+
+
+def test_h3_authoritative_source_drops_duplicate_storyboard_prose() -> None:
+    prompt = (
+        "【首帧锁定】旧的冗长说明\n【动作与表演节拍】重复内容\n"
+        "【模型执行主提示词】[出镜角色-物品-场景]\n权威七模块执行稿"
+    )
+    assert h3_authoritative_source(prompt) == (
+        "[出镜角色-物品-场景]\n权威七模块执行稿"
+    )
 
 
 def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) -> None:
