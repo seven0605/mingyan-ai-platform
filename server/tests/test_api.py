@@ -226,6 +226,9 @@ def test_h3_axis_continuity_removes_cross_axis_language() -> None:
     assert "across the 180-degree line" not in enforce_h3_axis_continuity(
         "[Shot 2] cutting across the 180-degree line to a low angle."
     )
+    assert "across the 180-degree axis" not in enforce_h3_axis_continuity(
+        "[Shot 3] cuts over forty degrees across the 180-degree axis to a wide shot."
+    )
 
 
 def test_h3_authoritative_source_drops_duplicate_storyboard_prose() -> None:

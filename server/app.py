@@ -796,9 +796,14 @@ def enforce_h3_axis_continuity(content: str) -> str:
         "remaining on the original side of the 180-degree axis and shifting",
         content,
     )
-    return re.sub(
+    content = re.sub(
         r"(?i)crossing the 180-degree(?: axis)?(?: line)?",
         "preserving the original side of the 180-degree axis",
+        content,
+    )
+    return re.sub(
+        r"(?i)across the 180-degree(?: axis)?(?: line)?",
+        "while remaining on the original side of the 180-degree axis",
         content,
     )
 
