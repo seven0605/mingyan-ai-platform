@@ -111,6 +111,7 @@ export function getImageModelSettings() {
 export function saveImageModelSettings(input: {
   baseUrl: string;
   model: string;
+  concurrency: number;
   apiKey?: string;
 }) {
   return request<ImageModelSettings>("/api/settings/image-model", {
@@ -132,6 +133,7 @@ export function getVideoModelSettings() {
 export function saveVideoModelSettings(input: {
   baseUrl: string;
   model: string;
+  concurrency: number;
   apiKey?: string;
 }) {
   return request<VideoModelSettings>("/api/settings/video-model", {

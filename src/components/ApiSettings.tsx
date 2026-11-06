@@ -69,6 +69,7 @@ export function ApiSettings({
   const [activeTab, setActiveTab] = useState<SettingsTab>("image");
   const [baseUrl, setBaseUrl] = useState(IMAGE_DEFAULT_BASE_URL);
   const [model, setModel] = useState(IMAGE_DEFAULT_MODEL);
+  const [concurrency, setConcurrency] = useState(3);
   const [apiKey, setApiKey] = useState("");
   const [workflowName, setWorkflowName] = useState("MiniMax H3 · 15秒 API 工作流");
   const [workflowJson, setWorkflowJson] = useState("");
@@ -95,6 +96,7 @@ export function ApiSettings({
     if (activeTab === "image") {
       setBaseUrl(imageSettings?.baseUrl || IMAGE_DEFAULT_BASE_URL);
       setModel(imageSettings?.model || IMAGE_DEFAULT_MODEL);
+      setConcurrency(imageSettings?.concurrency ?? 3);
       return;
     }
     if (activeTab === "video") {
@@ -107,6 +109,7 @@ export function ApiSettings({
       } else {
         setBaseUrl(videoSettings?.baseUrl || VIDEO_DEFAULT_BASE_URL);
         setModel(videoSettings?.model || VIDEO_DEFAULT_MODEL);
+        setConcurrency(videoSettings?.concurrency ?? 3);
       }
       return;
     }
@@ -125,7 +128,11 @@ export function ApiSettings({
       || allowInsecureTls !== comfyUIVideoSettings?.allowInsecureTls,
     )
     : Boolean(
-      baseUrl.trim() !== settings?.baseUrl || model.trim() !== settings?.model || apiKey.trim(),
+      baseUrl.trim() !== settings?.baseUrl
+      || model.trim() !== settings?.model
+      || apiKey.trim()
+      || (isImage && concurrency !== imageSettings?.concurrency)
+      || (isVideo && concurrency !== videoSettings?.concurrency),
     );
   const canSave = isComfyVideo
     ? Boolean(baseUrl.trim() && workflowName.trim() && workflowJson.trim() && hasUnsavedChanges && !saving)
@@ -179,7 +186,7 @@ export function ApiSettings({
         ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
       };
       if (isImage) {
-        onImageSettingsChange(await saveImageModelSettings(input));
+        onImageSettingsChange(await saveImageModelSettings({ ...input, concurrency }));
         setMessage("图像模型配置已安全保存，可以进行免生图连接测试。");
       } else if (isVideo) {
         if (isComfyVideo) {
@@ -191,7 +198,7 @@ export function ApiSettings({
           }));
           setMessage("云端 ComfyUI H3 配置已保存，可以进行免生成连接测试。");
         } else {
-          onVideoSettingsChange(await saveVideoModelSettings(input));
+          onVideoSettingsChange(await saveVideoModelSettings({ ...input, concurrency }));
           setMessage("视频 API 配置已安全保存，可以进行免生成连接测试。");
         }
       } else {
@@ -338,6 +345,27 @@ export function ApiSettings({
             <small>{isImage ? "已预填 tt-image-2.5，必须与服务商后台显示的 ID 一致。" : isVideo ? "已预填 BD Seedance2.5；中间空格和大小写必须保持不变。" : "必须与服务商文档中的模型 ID 完全一致。"}</small>
           </label> : null}
 
+          {isImage || (isVideo && !isComfyVideo) ? (
+            <label className="settings-field">
+              <span>最大并发数</span>
+              <input
+                type="number"
+                min={1}
+                max={8}
+                value={concurrency}
+                onChange={(event) => setConcurrency(
+                  Math.min(8, Math.max(1, Number(event.target.value) || 1)),
+                )}
+                required
+              />
+              <small>
+                {isImage
+                  ? "同一批资产同时生成的任务数；建议先用 3，可在 1–8 之间调整。"
+                  : "独立视频任务可同时提交；连续依赖镜头仍按顺序执行。建议先用 3。"}
+              </small>
+            </label>
+          ) : null}
+
           {!isComfyVideo ? <label className="settings-field">
             <span>API 密钥</span>
             <div className="secret-input">
@@ -438,6 +466,7 @@ export function ApiSettings({
           <dl>
             <div><dt>服务商</dt><dd>{isImage ? "不鸣AI" : isComfyVideo ? "自有云端 ComfyUI" : isVideo ? "睡哭了" : "OpenAI 兼容"}</dd></div>
             <div><dt>模型</dt><dd>{model || "尚未填写"}</dd></div>
+            {(isImage || isVideo) ? <div><dt>并发任务</dt><dd>{isComfyVideo ? "1（单卡串行）" : concurrency}</dd></div> : null}
             <div><dt>{isComfyVideo ? "工作流" : "凭据状态"}</dt><dd>{isComfyVideo ? comfyUIVideoSettings?.workflowConfigured ? "已导入" : "尚未导入" : hasCredential ? "已安全保存" : "尚未保存"}</dd></div>
             <div><dt>数据位置</dt><dd>{isComfyVideo ? "本机 + 你的云端" : "仅限这台电脑"}</dd></div>
           </dl>

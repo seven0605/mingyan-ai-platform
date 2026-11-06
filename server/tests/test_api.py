@@ -1,6 +1,8 @@
 from pathlib import Path
 import json
 import sqlite3
+import threading
+import time
 
 import httpx
 from fastapi.testclient import TestClient
@@ -448,6 +450,8 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
     image_generation_failed = False
     image_requests: list[dict] = []
     video_requests: list[dict] = []
+    video_request_state = {"active": 0, "max": 0}
+    video_request_lock = threading.Lock()
     fake_tunnel = FakeAssetTunnel()
 
     script_plan_payload = {
@@ -687,17 +691,30 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         if request.url.path == "/v1/videos":
             assert request.headers["Authorization"] == "Bearer video-secret-not-for-sqlite"
             request_payload = json.loads(request.content)
-            video_requests.append(request_payload)
+            with video_request_lock:
+                video_requests.append(request_payload)
+                task_number = len(video_requests)
+                video_request_state["active"] += 1
+                video_request_state["max"] = max(
+                    video_request_state["max"], video_request_state["active"]
+                )
+            time.sleep(0.02)
+            with video_request_lock:
+                video_request_state["active"] -= 1
             assert request_payload["model"] == "BD Seedance2.5"
             assert "【参考图顺序锁定】图1=" in request_payload["prompt"]
             assert request_payload["seconds"] == "30"
-            assert "【00-15秒｜第1集·镜头组1】" in request_payload["prompt"]
-            assert "【15-30秒｜第1集·镜头组2】" in request_payload["prompt"]
+            first_pair = "【00-15秒｜第1集·镜头组1】" in request_payload["prompt"]
+            if first_pair:
+                assert "【15-30秒｜第1集·镜头组2】" in request_payload["prompt"]
+            else:
+                assert "【00-15秒｜第1集·镜头组3】" in request_payload["prompt"]
+                assert "【15-30秒｜第1集·镜头组4】" in request_payload["prompt"]
             assert "【全局连续性硬锁】" in request_payload["prompt"]
             assert "【首帧锁定】" in request_payload["prompt"]
             assert "镜头节拍 1" in request_payload["prompt"]
-            assert "用于e1-g1" in request_payload["prompt"]
-            assert "用于e1-g2" in request_payload["prompt"]
+            assert f"e1-g{1 if first_pair else 3}" in request_payload["prompt"]
+            assert f"e1-g{2 if first_pair else 4}" in request_payload["prompt"]
             assert "同名人物跨镜头组必须保持同一身份" in request_payload["prompt"]
             assert "身份母版为最高优先级" in request_payload["prompt"]
             assert "服装、发型、身体状态与情绪" in request_payload["prompt"]
@@ -710,10 +727,13 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
                 url.startswith("https://assets.example.com/")
                 for url in reference_urls
             )
-            assert any(generated_image["id"] in url for url in reference_urls)
-            assert any(second_image["id"] in url for url in reference_urls)
+            if first_pair:
+                assert any(generated_image["id"] in url for url in reference_urls)
+                assert any(second_image["id"] in url for url in reference_urls)
+            else:
+                assert any(second_image["id"] in url for url in reference_urls)
             return httpx.Response(
-                200, json={"id": f"video-task-{len(video_requests)}"}
+                200, json={"id": f"video-task-{task_number}"}
             )
         if request.url.path.endswith("/content") and request.url.path.startswith(
             "/v1/videos/"
@@ -904,6 +924,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             "model": "tt-image-2.5",
             "hasCredential": True,
             "configured": True,
+            "concurrency": 3,
             "updatedAt": configured_image.json()["updatedAt"],
         }
         assert "apiKey" not in configured_image.json()
@@ -934,6 +955,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             "model": "BD Seedance2.5",
             "hasCredential": True,
             "configured": True,
+            "concurrency": 3,
             "updatedAt": configured_video.json()["updatedAt"],
         }
         assert "apiKey" not in configured_video.json()
@@ -1447,7 +1469,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             len(item["assetReferences"]) >= 2
             for item in video_plan.json()["items"]
         )
-        selected_video_ids = [item["id"] for item in video_plan.json()["items"][:2]]
+        selected_video_ids = [item["id"] for item in video_plan.json()["items"][:4]]
         first_yun_reference = next(
             reference
             for reference in video_plan.json()["items"][0]["assetReferences"]
@@ -1494,10 +1516,12 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             f"/api/projects/{project['id']}/video-plan/queue"
         )
         assert queued_videos.status_code == 200
-        assert [task["type"] for task in queued_videos.json()] == ["video"]
-        assert [task["status"] for task in queued_videos.json()] == ["queued"]
+        assert [task["type"] for task in queued_videos.json()] == ["video", "video"]
+        assert [task["status"] for task in queued_videos.json()] == ["queued", "queued"]
         assert queued_videos.json()[0]["title"].endswith("镜头组 1–2（30秒）")
-        assert len(video_requests) == 1
+        assert queued_videos.json()[1]["title"].endswith("镜头组 3–4（30秒）")
+        assert len(video_requests) == 2
+        assert video_request_state["max"] == 2
         assert fake_tunnel.start_count == 1
         assert fake_tunnel.verify_count == 1
         assert fake_tunnel.running is False
@@ -1506,7 +1530,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
             for task in client.get(f"/api/projects/{project['id']}/tasks").json()
             if task["type"] == "video"
         ]
-        assert len(video_tasks) == 1
+        assert len(video_tasks) == 2
         assert all(task["status"] == "completed" for task in video_tasks)
         assert all(task["providerTaskId"].startswith("video-task-") for task in video_tasks)
         generated_video = client.get(video_tasks[0]["resultUrl"])
@@ -1566,7 +1590,7 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert restored_yun_zishu["primaryReferenceImageId"] == generated_image["id"]
         assert client.get(restored_yun_zishu["referenceImages"][0]["url"]).status_code == 200
         restored_tasks = client.get(f"/api/projects/{projects[0]['id']}/tasks").json()
-        assert len(restored_tasks) == 4
+        assert len(restored_tasks) == 5
         assert all(task["status"] == "completed" for task in restored_tasks)
         restored_batch_plan = client.get(
             f"/api/projects/{projects[0]['id']}/assets/batch-plan"
@@ -1594,9 +1618,12 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
     credentials = MemoryCredentialStore()
     created_prompts: list[str] = []
     retry_enabled = False
+    active_requests = 0
+    max_active_requests = 0
+    request_lock = threading.Lock()
 
     def model_handler(request: httpx.Request) -> httpx.Response:
-        nonlocal retry_enabled
+        nonlocal active_requests, max_active_requests, retry_enabled
         if request.url.host == "cdn.example.com":
             return httpx.Response(
                 200,
@@ -1606,13 +1633,24 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
         if request.url.path == "/v1/media/generate":
             payload = json.loads(request.content)
             created_prompts.append(payload["prompt"])
+            with request_lock:
+                active_requests += 1
+                max_active_requests = max(max_active_requests, active_requests)
+            time.sleep(0.02)
+            with request_lock:
+                active_requests -= 1
+            task_id = (
+                "queue-task-scene"
+                if "场景乙" in payload["prompt"]
+                else "queue-task-character"
+            )
             return httpx.Response(
                 200,
-                json={"data": {"task_id": f"queue-task-{len(created_prompts)}"}},
+                json={"data": {"task_id": task_id}},
             )
         if request.url.path == "/v1/media/status":
             task_id = request.url.params["task_id"]
-            if task_id == "queue-task-2" and not retry_enabled:
+            if task_id == "queue-task-scene" and not retry_enabled:
                 return httpx.Response(
                     200,
                     json={
@@ -1654,6 +1692,7 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
                 "baseUrl": "https://example.com/v1",
                 "model": "tt-image-2.5",
                 "apiKey": "queue-image-secret",
+                    "concurrency": 2,
             },
         )
         project = client.post(
@@ -1721,7 +1760,8 @@ def test_asset_generation_queue_retries_and_resumes(tmp_path: Path) -> None:
         queued = client.post(f"/api/projects/{project['id']}/assets/batch-plan/queue")
         assert queued.status_code == 200
         assert [item["status"] for item in queued.json()] == ["queued", "queued"]
-        assert created_prompts == ["角色甲完整提示词", "场景乙完整提示词"]
+        assert set(created_prompts) == {"角色甲完整提示词", "场景乙完整提示词"}
+        assert max_active_requests == 2
 
         tasks = client.get(f"/api/projects/{project['id']}/tasks").json()
         assert {task["status"] for task in tasks} == {"completed", "failed"}

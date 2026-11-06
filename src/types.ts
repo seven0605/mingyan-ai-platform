@@ -77,6 +77,7 @@ export interface ImageModelSettings {
   model: string;
   hasCredential: boolean;
   configured: boolean;
+  concurrency: number;
   updatedAt: string | null;
 }
 
@@ -86,6 +87,7 @@ export interface VideoModelSettings {
   model: string;
   hasCredential: boolean;
   configured: boolean;
+  concurrency: number;
   updatedAt: string | null;
 }
 

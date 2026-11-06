@@ -7,7 +7,9 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -140,7 +142,7 @@ class TextModelConnectionOut(BaseModel):
 
 
 class ImageModelSettingsUpdate(TextModelSettingsUpdate):
-    pass
+    concurrency: int = Field(default=3, ge=1, le=8)
 
 
 class ImageModelSettingsOut(BaseModel):
@@ -149,11 +151,12 @@ class ImageModelSettingsOut(BaseModel):
     model: str
     hasCredential: bool
     configured: bool
+    concurrency: int
     updatedAt: str | None
 
 
 class VideoModelSettingsUpdate(TextModelSettingsUpdate):
-    pass
+    concurrency: int = Field(default=3, ge=1, le=8)
 
 
 class VideoModelSettingsOut(BaseModel):
@@ -162,6 +165,7 @@ class VideoModelSettingsOut(BaseModel):
     model: str
     hasCredential: bool
     configured: bool
+    concurrency: int
     updatedAt: str | None
 
 
@@ -882,6 +886,7 @@ def initialize_database(database_path: Path) -> None:
                 kind TEXT PRIMARY KEY,
                 base_url TEXT NOT NULL,
                 model TEXT NOT NULL,
+                concurrency INTEGER NOT NULL DEFAULT 3,
                 updated_at TEXT NOT NULL
             )
             """
@@ -1038,6 +1043,14 @@ def initialize_database(database_path: Path) -> None:
         if "approved_at" not in screenplay_columns:
             connection.execute(
                 "ALTER TABLE project_screenplays ADD COLUMN approved_at TEXT"
+            )
+        model_settings_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(model_settings)").fetchall()
+        }
+        if "concurrency" not in model_settings_columns:
+            connection.execute(
+                "ALTER TABLE model_settings ADD COLUMN concurrency INTEGER NOT NULL DEFAULT 3"
             )
         video_job_columns = {
             row["name"]
@@ -1993,6 +2006,10 @@ def create_app(
     database_path = resolved_data_dir / "mingyan.sqlite3"
     credentials = credential_store or SystemCredentialStore()
     asset_tunnel = asset_tunnel_service or TemporaryAssetTunnel(resolved_data_dir)
+    batch_guard = threading.Lock()
+    active_asset_batches: set[str] = set()
+    active_video_batches: set[str] = set()
+    asset_library_write_lock = threading.Lock()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -2270,6 +2287,7 @@ into the next action inside [Shot 1].
             model=model,
             hasCredential=has_credential,
             configured=bool(base_url and model and has_credential),
+            concurrency=int(row["concurrency"]) if row else 3,
             updatedAt=row["updated_at"] if row else None,
         )
 
@@ -2306,6 +2324,7 @@ into the next action inside [Shot 1].
             model=model,
             hasCredential=has_credential,
             configured=bool(base_url and model and has_credential),
+            concurrency=int(row["concurrency"]) if row else 3,
             updatedAt=row["updated_at"] if row else None,
         )
 
@@ -2669,45 +2688,50 @@ into the next action inside [Shot 1].
                 identityReferenceImageId=identity_reference_id,
                 createdAt=now,
             )
-            with connect(database_path) as connection:
-                asset_row = connection.execute(
-                    "SELECT * FROM project_assets WHERE project_id = ?",
-                    (job["project_id"],),
-                ).fetchone()
-                if asset_row is None:
-                    raise HTTPException(status_code=404, detail="资产库不存在")
-                library = AssetLibraryPayload.model_validate(json.loads(asset_row["payload"]))
-                if not any(item.id == job["asset_id"] for item in library.items):
-                    raise HTTPException(status_code=404, detail="资产不存在")
-                updated_library = library.model_copy(
-                    update={
-                        "items": [
-                            item.model_copy(
-                                update={"referenceImages": [*item.referenceImages, image]}
-                            )
-                            if item.id == job["asset_id"]
-                            else item
-                            for item in library.items
-                        ]
-                    }
-                )
-                connection.execute(
-                    "UPDATE project_assets SET payload = ?, updated_at = ? WHERE project_id = ?",
-                    (updated_library.model_dump_json(), now, job["project_id"]),
-                )
-                connection.execute(
-                    "UPDATE projects SET updated_at = ? WHERE id = ?",
-                    (now, job["project_id"]),
-                )
-                connection.execute(
-                    """
-                    UPDATE asset_generation_jobs
-                    SET status = 'completed', provider_task_id = ?, result_url = ?,
-                        cost = ?, error = '', updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (provider_task_id, image.url, cost, now, job_id),
-                )
+            with asset_library_write_lock:
+                with connect(database_path) as connection:
+                    asset_row = connection.execute(
+                        "SELECT * FROM project_assets WHERE project_id = ?",
+                        (job["project_id"],),
+                    ).fetchone()
+                    if asset_row is None:
+                        raise HTTPException(status_code=404, detail="资产库不存在")
+                    library = AssetLibraryPayload.model_validate(
+                        json.loads(asset_row["payload"])
+                    )
+                    if not any(item.id == job["asset_id"] for item in library.items):
+                        raise HTTPException(status_code=404, detail="资产不存在")
+                    updated_library = library.model_copy(
+                        update={
+                            "items": [
+                                item.model_copy(
+                                    update={
+                                        "referenceImages": [*item.referenceImages, image]
+                                    }
+                                )
+                                if item.id == job["asset_id"]
+                                else item
+                                for item in library.items
+                            ]
+                        }
+                    )
+                    connection.execute(
+                        "UPDATE project_assets SET payload = ?, updated_at = ? WHERE project_id = ?",
+                        (updated_library.model_dump_json(), now, job["project_id"]),
+                    )
+                    connection.execute(
+                        "UPDATE projects SET updated_at = ? WHERE id = ?",
+                        (now, job["project_id"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE asset_generation_jobs
+                        SET status = 'completed', provider_task_id = ?, result_url = ?,
+                            cost = ?, error = '', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (provider_task_id, image.url, cost, now, job_id),
+                    )
         except (
             HTTPException,
             httpx.RequestError,
@@ -2735,44 +2759,59 @@ into the next action inside [Shot 1].
                 )
 
     def process_generation_batch(batch_id: str) -> None:
-        while True:
-            with connect(database_path) as connection:
-                running = connection.execute(
-                    """
-                    SELECT id FROM asset_generation_jobs
-                    WHERE batch_id = ? AND status = 'running'
-                    """,
-                    (batch_id,),
-                ).fetchone()
-                if running is not None:
-                    return
-                queued = connection.execute(
-                    """
-                    SELECT id FROM asset_generation_jobs
-                    WHERE batch_id = ? AND status = 'queued'
-                    ORDER BY created_at, id LIMIT 1
-                    """,
-                    (batch_id,),
-                ).fetchone()
-                if queued is None:
-                    return
-                claimed = connection.execute(
-                    """
-                    UPDATE asset_generation_jobs
-                    SET status = 'running', error = '', updated_at = ?
-                    WHERE id = ? AND status = 'queued'
-                    """,
-                    (utc_now(), queued["id"]),
-                )
-            if claimed.rowcount:
-                process_generation_job(queued["id"])
+        with batch_guard:
+            if batch_id in active_asset_batches:
+                return
+            active_asset_batches.add(batch_id)
+        try:
+            concurrency = image_model_settings().concurrency
+            while True:
+                claimed_ids: list[str] = []
                 with connect(database_path) as connection:
-                    saved = connection.execute(
-                        "SELECT status FROM asset_generation_jobs WHERE id = ?",
-                        (queued["id"],),
-                    ).fetchone()
-                if saved is not None and saved["status"] == "interrupted":
+                    queued = connection.execute(
+                        """
+                        SELECT id FROM asset_generation_jobs
+                        WHERE batch_id = ? AND status = 'queued'
+                        ORDER BY created_at, id LIMIT ?
+                        """,
+                        (batch_id, concurrency),
+                    ).fetchall()
+                    if not queued:
+                        return
+                    for row in queued:
+                        claimed = connection.execute(
+                            """
+                            UPDATE asset_generation_jobs
+                            SET status = 'running', error = '', updated_at = ?
+                            WHERE id = ? AND status = 'queued'
+                            """,
+                            (utc_now(), row["id"]),
+                        )
+                        if claimed.rowcount:
+                            claimed_ids.append(row["id"])
+                if not claimed_ids:
                     return
+                with ThreadPoolExecutor(max_workers=len(claimed_ids)) as executor:
+                    futures = [
+                        executor.submit(process_generation_job, job_id)
+                        for job_id in claimed_ids
+                    ]
+                    for future in futures:
+                        future.result()
+                with connect(database_path) as connection:
+                    interrupted = connection.execute(
+                        """
+                        SELECT id FROM asset_generation_jobs
+                        WHERE id IN ({}) AND status = 'interrupted'
+                        LIMIT 1
+                        """.format(",".join("?" for _ in claimed_ids)),
+                        claimed_ids,
+                    ).fetchone()
+                if interrupted is not None:
+                    return
+        finally:
+            with batch_guard:
+                active_asset_batches.discard(batch_id)
 
     def video_response_detail(response: httpx.Response, fallback: str) -> str:
         try:
@@ -3049,7 +3088,36 @@ into the next action inside [Shot 1].
                     (status, provider_task_id, message, utc_now(), job["id"]),
                 )
 
-    def process_video_job(job_id: str) -> None:
+    def video_job_reference_files(
+        job: sqlite3.Row,
+    ) -> tuple[list[dict], dict[str, Path]]:
+        references = json.loads(job["reference_assets"])
+        files: dict[str, Path] = {}
+        for reference in references:
+            logical_id = str(reference["logicalId"])
+            if reference.get("role") == "identity":
+                image_path = asset_identity_master_file_path(
+                    job["project_id"],
+                    str(reference["assetId"]),
+                    str(reference["imageId"]),
+                )
+            else:
+                image_path = asset_reference_file_path(
+                    job["project_id"],
+                    str(reference["assetId"]),
+                    str(reference["imageId"]),
+                )
+            if image_path is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{reference['name']} 的主参考图文件不存在",
+                )
+            files[logical_id] = image_path
+        return references, files
+
+    def process_video_job(
+        job_id: str, shared_reference_urls: dict[str, str] | None = None
+    ) -> None:
         with connect(database_path) as connection:
             job = connection.execute(
                 "SELECT * FROM video_generation_jobs WHERE id = ?", (job_id,)
@@ -3075,31 +3143,12 @@ into the next action inside [Shot 1].
                 follow_redirects=True,
             ) as client:
                 if not provider_task_id:
-                    references = json.loads(job["reference_assets"])
-                    files: dict[str, Path] = {}
-                    for reference in references:
-                        logical_id = str(reference["logicalId"])
-                        if reference.get("role") == "identity":
-                            image_path = asset_identity_master_file_path(
-                                job["project_id"],
-                                str(reference["assetId"]),
-                                str(reference["imageId"]),
-                            )
-                        else:
-                            image_path = asset_reference_file_path(
-                                job["project_id"],
-                                str(reference["assetId"]),
-                                str(reference["imageId"]),
-                            )
-                        if image_path is None:
-                            raise HTTPException(
-                                status_code=409,
-                                detail=f"{reference['name']} 的主参考图文件不存在",
-                            )
-                        files[logical_id] = image_path
-                    reference_urls = asset_tunnel.start(job["project_id"], files)
-                    tunnel_started = True
-                    asset_tunnel.verify_urls(reference_urls)
+                    references, files = video_job_reference_files(job)
+                    reference_urls = shared_reference_urls
+                    if reference_urls is None:
+                        reference_urls = asset_tunnel.start(job["project_id"], files)
+                        tunnel_started = True
+                        asset_tunnel.verify_urls(reference_urls)
                     ordered_urls = [
                         reference_urls[str(reference["logicalId"])]
                         for reference in references
@@ -3313,60 +3362,157 @@ into the next action inside [Shot 1].
                 asset_tunnel.stop()
 
     def process_video_batch(batch_id: str) -> None:
-        while True:
+        with batch_guard:
+            if batch_id in active_video_batches:
+                return
+            active_video_batches.add(batch_id)
+        try:
             with connect(database_path) as connection:
-                running = connection.execute(
+                batch = connection.execute(
                     """
-                    SELECT id FROM video_generation_jobs
-                    WHERE batch_id = ? AND status = 'running'
+                    SELECT backend, project_id FROM video_generation_jobs
+                    WHERE batch_id = ? ORDER BY created_at, id LIMIT 1
                     """,
                     (batch_id,),
                 ).fetchone()
-                if running is not None:
-                    return
-                queued = connection.execute(
-                    """
-                    SELECT id FROM video_generation_jobs
-                    WHERE batch_id = ? AND status = 'queued'
-                    ORDER BY created_at, id LIMIT 1
-                    """,
-                    (batch_id,),
-                ).fetchone()
-                if queued is None:
-                    return
-                claimed = connection.execute(
-                    """
-                    UPDATE video_generation_jobs
-                    SET status = 'running', error = '', updated_at = ?
-                    WHERE id = ? AND status = 'queued'
-                    """,
-                    (utc_now(), queued["id"]),
-                )
-            if claimed.rowcount:
-                process_video_job(queued["id"])
+            if batch is None:
+                return
+            if batch["backend"] == "comfyui":
+                while True:
+                    with connect(database_path) as connection:
+                        queued = connection.execute(
+                            """
+                            SELECT id FROM video_generation_jobs
+                            WHERE batch_id = ? AND status = 'queued'
+                            ORDER BY created_at, id LIMIT 1
+                            """,
+                            (batch_id,),
+                        ).fetchone()
+                        if queued is None:
+                            return
+                        claimed = connection.execute(
+                            """
+                            UPDATE video_generation_jobs
+                            SET status = 'running', error = '', updated_at = ?
+                            WHERE id = ? AND status = 'queued'
+                            """,
+                            (utc_now(), queued["id"]),
+                        )
+                    if not claimed.rowcount:
+                        continue
+                    process_video_job(queued["id"])
+                    with connect(database_path) as connection:
+                        saved = connection.execute(
+                            "SELECT status FROM video_generation_jobs WHERE id = ?",
+                            (queued["id"],),
+                        ).fetchone()
+                        if saved is not None and saved["status"] != "completed":
+                            connection.execute(
+                                """
+                                UPDATE video_generation_jobs
+                                SET status = 'interrupted',
+                                    error = '前序镜头组未完成，已自动暂停连续批量队列',
+                                    updated_at = ?
+                                WHERE batch_id = ? AND status = 'queued'
+                                """,
+                                (utc_now(), batch_id),
+                            )
+                            return
+
+            concurrency = video_model_settings().concurrency
+            while True:
+                claimed_ids: list[str] = []
                 with connect(database_path) as connection:
-                    saved = connection.execute(
-                        "SELECT status, backend FROM video_generation_jobs WHERE id = ?",
-                        (queued["id"],),
-                    ).fetchone()
-                    if (
-                        saved is not None
-                        and saved["backend"] == "comfyui"
-                        and saved["status"] != "completed"
-                    ):
+                    queued = connection.execute(
+                        """
+                        SELECT id FROM video_generation_jobs
+                        WHERE batch_id = ? AND status = 'queued'
+                        ORDER BY created_at, id LIMIT ?
+                        """,
+                        (batch_id, concurrency),
+                    ).fetchall()
+                    if not queued:
+                        return
+                    for row in queued:
+                        claimed = connection.execute(
+                            """
+                            UPDATE video_generation_jobs
+                            SET status = 'running', error = '', updated_at = ?
+                            WHERE id = ? AND status = 'queued'
+                            """,
+                            (utc_now(), row["id"]),
+                        )
+                        if claimed.rowcount:
+                            claimed_ids.append(row["id"])
+                if not claimed_ids:
+                    return
+
+                shared_reference_urls: dict[str, str] | None = None
+                tunnel_started = False
+                try:
+                    files: dict[str, Path] = {}
+                    with connect(database_path) as connection:
+                        jobs = connection.execute(
+                            """
+                            SELECT * FROM video_generation_jobs
+                            WHERE id IN ({})
+                            """.format(",".join("?" for _ in claimed_ids)),
+                            claimed_ids,
+                        ).fetchall()
+                    for job in jobs:
+                        if job["provider_task_id"]:
+                            continue
+                        _, job_files = video_job_reference_files(job)
+                        files.update(job_files)
+                    if files:
+                        shared_reference_urls = asset_tunnel.start(
+                            batch["project_id"], files
+                        )
+                        tunnel_started = True
+                        asset_tunnel.verify_urls(shared_reference_urls)
+                    with ThreadPoolExecutor(max_workers=len(claimed_ids)) as executor:
+                        futures = [
+                            executor.submit(
+                                process_video_job, job_id, shared_reference_urls
+                            )
+                            for job_id in claimed_ids
+                        ]
+                        for future in futures:
+                            future.result()
+                except (
+                    HTTPException,
+                    OSError,
+                    RuntimeError,
+                    KeyError,
+                    ValueError,
+                ) as error:
+                    message = str(error.detail) if isinstance(error, HTTPException) else str(error)
+                    with connect(database_path) as connection:
                         connection.execute(
                             """
                             UPDATE video_generation_jobs
-                            SET status = 'interrupted',
-                                error = '前序镜头组未完成，已自动暂停连续批量队列',
-                                updated_at = ?
-                            WHERE batch_id = ? AND status = 'queued'
-                            """,
-                            (utc_now(), batch_id),
+                            SET status = 'interrupted', error = ?, updated_at = ?
+                            WHERE id IN ({}) AND status = 'running'
+                            """.format(",".join("?" for _ in claimed_ids)),
+                            [message, utc_now(), *claimed_ids],
                         )
-                        return
-                    if saved is not None and saved["status"] == "interrupted":
-                        return
+                finally:
+                    if tunnel_started:
+                        asset_tunnel.stop()
+                with connect(database_path) as connection:
+                    interrupted = connection.execute(
+                        """
+                        SELECT id FROM video_generation_jobs
+                        WHERE id IN ({}) AND status = 'interrupted'
+                        LIMIT 1
+                        """.format(",".join("?" for _ in claimed_ids)),
+                        claimed_ids,
+                    ).fetchone()
+                if interrupted is not None:
+                    return
+        finally:
+            with batch_guard:
+                active_video_batches.discard(batch_id)
 
     @application.get("/api/settings/text-model", response_model=TextModelSettingsOut)
     def get_text_model_settings() -> TextModelSettingsOut:
@@ -3467,14 +3613,15 @@ into the next action inside [Shot 1].
         with connect(database_path) as connection:
             connection.execute(
                 """
-                INSERT INTO model_settings (kind, base_url, model, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO model_settings (kind, base_url, model, concurrency, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(kind) DO UPDATE SET
                     base_url = excluded.base_url,
                     model = excluded.model,
+                    concurrency = excluded.concurrency,
                     updated_at = excluded.updated_at
                 """,
-                ("image", payload.baseUrl, payload.model, now),
+                ("image", payload.baseUrl, payload.model, payload.concurrency, now),
             )
         return image_model_settings()
 
@@ -3548,14 +3695,15 @@ into the next action inside [Shot 1].
         with connect(database_path) as connection:
             connection.execute(
                 """
-                INSERT INTO model_settings (kind, base_url, model, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO model_settings (kind, base_url, model, concurrency, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(kind) DO UPDATE SET
                     base_url = excluded.base_url,
                     model = excluded.model,
+                    concurrency = excluded.concurrency,
                     updated_at = excluded.updated_at
                 """,
-                ("video", payload.baseUrl, payload.model, now),
+                ("video", payload.baseUrl, payload.model, payload.concurrency, now),
             )
         return video_model_settings()
 
@@ -4990,9 +5138,11 @@ into the next action inside [Shot 1].
             active = connection.execute(
                 """
                 SELECT id FROM video_generation_jobs
-                WHERE status IN ('queued', 'running', 'interrupted')
+                WHERE backend = ?
+                  AND status IN ('queued', 'running', 'interrupted')
                 LIMIT 1
-                """
+                """,
+                (backend.activeBackend,),
             ).fetchone()
         if active is not None:
             raise HTTPException(
