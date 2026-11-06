@@ -1428,6 +1428,20 @@ def pack_video_plan_items(
     return batches
 
 
+def h3_batch_sequence_error(items: list[VideoProductionPlanItem]) -> str:
+    ordered = sorted(items, key=lambda item: (item.episodeNumber, item.groupIndex))
+    if len(ordered) < 2:
+        return ""
+    if any(item.episodeNumber != ordered[0].episodeNumber for item in ordered[1:]):
+        return "H3 连续批量生产暂时只支持同一集镜头组"
+    if any(
+        current.groupIndex != previous.groupIndex + 1
+        for previous, current in zip(ordered, ordered[1:])
+    ):
+        return "H3 连续批量生产必须选择连续镜头组，例如第 7–9 组"
+    return ""
+
+
 def build_video_batch_prompt(
     items: list[VideoProductionPlanItem],
     request_seconds: int = VIDEO_REQUEST_SECONDS,
@@ -3332,11 +3346,27 @@ into the next action inside [Shot 1].
                 process_video_job(queued["id"])
                 with connect(database_path) as connection:
                     saved = connection.execute(
-                        "SELECT status FROM video_generation_jobs WHERE id = ?",
+                        "SELECT status, backend FROM video_generation_jobs WHERE id = ?",
                         (queued["id"],),
                     ).fetchone()
-                if saved is not None and saved["status"] == "interrupted":
-                    return
+                    if (
+                        saved is not None
+                        and saved["backend"] == "comfyui"
+                        and saved["status"] != "completed"
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE video_generation_jobs
+                            SET status = 'interrupted',
+                                error = '前序镜头组未完成，已自动暂停连续批量队列',
+                                updated_at = ?
+                            WHERE batch_id = ? AND status = 'queued'
+                            """,
+                            (utc_now(), batch_id),
+                        )
+                        return
+                    if saved is not None and saved["status"] == "interrupted":
+                        return
 
     @application.get("/api/settings/text-model", response_model=TextModelSettingsOut)
     def get_text_model_settings() -> TextModelSettingsOut:
@@ -4951,6 +4981,10 @@ into the next action inside [Shot 1].
                 default=0,
             )
         selected_items = selected_video_plan_items(project_id)
+        if backend.activeBackend == "comfyui":
+            sequence_error = h3_batch_sequence_error(selected_items)
+            if sequence_error:
+                raise HTTPException(status_code=422, detail=sequence_error)
         video_reference_files(project_id, selected_items)
         with connect(database_path) as connection:
             active = connection.execute(
@@ -4966,10 +5000,19 @@ into the next action inside [Shot 1].
             )
 
         batch_id = str(uuid4())
-        video_batches = pack_video_plan_items(selected_items, request_seconds)
+        video_batches = (
+            [[item] for item in sorted(
+                selected_items,
+                key=lambda item: (item.episodeNumber, item.groupIndex),
+            )]
+            if backend.activeBackend == "comfyui"
+            else pack_video_plan_items(selected_items, request_seconds)
+        )
+        pending_h3_jobs: dict[str, str] = {}
         with connect(database_path) as connection:
             for items in video_batches:
                 now = utc_now()
+                job_id = str(uuid4())
                 references_by_id: dict[str, dict[str, object]] = {}
                 for item in items:
                     for reference in item.assetReferences:
@@ -5015,18 +5058,27 @@ into the next action inside [Shot 1].
                 if backend.activeBackend == "comfyui" and (
                     first_item.groupIndex > 1 or first_item.episodeNumber > 1
                 ):
+                    pending_previous_id: str | None = None
                     if first_item.groupIndex > 1:
                         previous_plan_item_id = (
                             f"e{first_item.episodeNumber}-g{first_item.groupIndex - 1}"
                         )
-                        previous_job = connection.execute(
-                            """
-                            SELECT id, plan_item_id FROM video_generation_jobs
-                            WHERE project_id = ? AND plan_item_id = ? AND status = 'completed'
-                            ORDER BY updated_at DESC LIMIT 1
-                            """,
-                            (project_id, previous_plan_item_id),
-                        ).fetchone()
+                        pending_previous_id = pending_h3_jobs.get(previous_plan_item_id)
+                        previous_job = (
+                            {
+                                "id": pending_previous_id,
+                                "plan_item_id": previous_plan_item_id,
+                            }
+                            if pending_previous_id
+                            else connection.execute(
+                                """
+                                SELECT id, plan_item_id FROM video_generation_jobs
+                                WHERE project_id = ? AND plan_item_id = ? AND status = 'completed'
+                                ORDER BY updated_at DESC LIMIT 1
+                                """,
+                                (project_id, previous_plan_item_id),
+                            ).fetchone()
+                        )
                     else:
                         previous_episode_prefix = f"e{first_item.episodeNumber - 1}-g"
                         previous_job = connection.execute(
@@ -5047,11 +5099,11 @@ into the next action inside [Shot 1].
                         )
                     video_dir = resolved_data_dir / "generated" / project_id / "videos"
                     previous_frame = video_dir / f"{previous_job['id']}-last-frame.png"
-                    if not previous_frame.is_file():
+                    if not pending_previous_id and not previous_frame.is_file():
                         previous_video = video_dir / f"{previous_job['id']}.mp4"
                         if previous_video.is_file():
                             extract_video_terminal_frame(previous_video, previous_frame)
-                    if not previous_frame.is_file():
+                    if not pending_previous_id and not previous_frame.is_file():
                         raise HTTPException(
                             status_code=409,
                             detail="上一镜头组缺少稳定终帧，暂不能生成下一条视频",
@@ -5094,7 +5146,7 @@ into the next action inside [Shot 1].
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                     """,
                     (
-                        str(uuid4()),
+                        job_id,
                         project_id,
                         batch_id,
                         "+".join(item.id for item in items),
@@ -5117,6 +5169,8 @@ into the next action inside [Shot 1].
                         now,
                     ),
                 )
+                if backend.activeBackend == "comfyui":
+                    pending_h3_jobs[first_item.id] = job_id
             rows = connection.execute(
                 """
                 SELECT * FROM video_generation_jobs
@@ -5483,6 +5537,15 @@ into the next action inside [Shot 1].
                     """,
                     (utc_now(), task_id),
                 )
+                if row["backend"] == "comfyui":
+                    connection.execute(
+                        """
+                        UPDATE video_generation_jobs
+                        SET status = 'queued', error = '', updated_at = ?
+                        WHERE batch_id = ? AND status = 'interrupted'
+                        """,
+                        (utc_now(), row["batch_id"]),
+                    )
                 saved = connection.execute(
                     "SELECT * FROM video_generation_jobs WHERE id = ?", (task_id,)
                 ).fetchone()
@@ -5512,6 +5575,11 @@ into the next action inside [Shot 1].
                 """
                 SELECT * FROM video_generation_jobs
                 WHERE project_id = ? AND status IN ('queued', 'interrupted')
+                  AND (backend != 'comfyui' OR NOT EXISTS (
+                    SELECT 1 FROM video_generation_jobs failed
+                    WHERE failed.batch_id = video_generation_jobs.batch_id
+                      AND failed.status = 'failed'
+                  ))
                 ORDER BY created_at, id
                 """,
                 (project_id,),
@@ -5531,6 +5599,11 @@ into the next action inside [Shot 1].
                 UPDATE video_generation_jobs
                 SET status = 'queued', error = '', updated_at = ?
                 WHERE project_id = ? AND status = 'interrupted'
+                  AND (backend != 'comfyui' OR NOT EXISTS (
+                    SELECT 1 FROM video_generation_jobs failed
+                    WHERE failed.batch_id = video_generation_jobs.batch_id
+                      AND failed.status = 'failed'
+                  ))
                 """,
                 (utc_now(), project_id),
             )

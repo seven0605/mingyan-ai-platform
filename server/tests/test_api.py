@@ -17,6 +17,7 @@ from server.app import (
     fit_h3_references,
     h3_authoritative_source,
     h3_dialogue_chunks_valid,
+    h3_batch_sequence_error,
     h3_shot_density_valid,
     is_collective_character,
     pack_video_plan_items,
@@ -136,6 +137,12 @@ def test_video_plan_items_pack_into_thirty_second_requests() -> None:
         ["e1-g1"],
         ["e1-g2"],
     ]
+    assert h3_batch_sequence_error([item(1, 15), item(2, 15)]) == ""
+    assert "连续镜头组" in h3_batch_sequence_error([item(1, 15), item(3, 15)])
+    second_episode = item(1, 15).model_copy(
+        update={"id": "e2-g1", "episodeNumber": 2}
+    )
+    assert "同一集" in h3_batch_sequence_error([item(1, 15), second_episode])
     h3_prompt = build_video_batch_prompt(
         [item(1, 15)], request_seconds=15, model_name="MiniMax H3"
     )

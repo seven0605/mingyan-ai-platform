@@ -38,12 +38,47 @@ interface VideoWorkspaceProps {
   onOpenTasks: () => void;
   onPlanReady: () => Promise<void>;
   videoModelConfigured: boolean;
+  activeVideoBackend: "api" | "comfyui";
 }
 
 const KIND_LABEL = { character: "角色", scene: "场景", prop: "道具" } as const;
 const VIDEO_REQUEST_SECONDS = 30;
 
-function countVideoRequests(items: VideoProductionPlanItem[], selectedIds: string[]) {
+function selectedItemsInOrder(items: VideoProductionPlanItem[], selectedIds: string[]) {
+  const selected = new Set(selectedIds);
+  return items
+    .filter((item) => selected.has(item.id))
+    .sort((left, right) => (
+      left.episodeNumber - right.episodeNumber || left.groupIndex - right.groupIndex
+    ));
+}
+
+function h3SelectionIssue(items: VideoProductionPlanItem[], selectedIds: string[]) {
+  const selected = selectedItemsInOrder(items, selectedIds);
+  if (selected.length < 2) return null;
+  if (selected.some((item) => item.episodeNumber !== selected[0].episodeNumber)) {
+    return "H3 连续批量生产暂时只支持选择同一集镜头组。";
+  }
+  if (selected.some((item, index) => (
+    index > 0 && item.groupIndex !== selected[index - 1].groupIndex + 1
+  ))) {
+    return "H3 连续批量生产必须选择连续镜头组，例如第 7–9 组。";
+  }
+  return null;
+}
+
+function h3SequenceLabel(items: VideoProductionPlanItem[], selectedIds: string[]) {
+  const selected = selectedItemsInOrder(items, selectedIds);
+  if (!selected.length) return "尚未选择镜头组";
+  return `第 ${selected[0].episodeNumber} 集 · ${selected.map((item) => item.groupIndex).join(" → ")}`;
+}
+
+function countVideoRequests(
+  items: VideoProductionPlanItem[],
+  selectedIds: string[],
+  activeVideoBackend: "api" | "comfyui",
+) {
+  if (activeVideoBackend === "comfyui") return selectedIds.length;
   const selected = new Set(selectedIds);
   let count = 0;
   let batchSeconds = 0;
@@ -76,6 +111,7 @@ export function VideoWorkspace({
   onOpenTasks,
   onPlanReady,
   videoModelConfigured,
+  activeVideoBackend,
 }: VideoWorkspaceProps) {
   const [plan, setPlan] = useState<VideoProductionPlan | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -126,9 +162,20 @@ export function VideoWorkspace({
 
   const activeItem = plan?.items.find((item) => item.id === activeId) ?? null;
   const readyItems = plan?.items.filter((item) => item.ready) ?? [];
+  const isComfyVideo = activeVideoBackend === "comfyui";
   const blockedCount = (plan?.items.length ?? 0) - readyItems.length;
-  const requestCount = countVideoRequests(plan?.items ?? [], selectedIds);
-  const planReady = Boolean(plan?.current && !dirty && selectedIds.length);
+  const requestCount = countVideoRequests(
+    plan?.items ?? [],
+    selectedIds,
+    activeVideoBackend,
+  );
+  const selectionIssue = isComfyVideo
+    ? h3SelectionIssue(plan?.items ?? [], selectedIds)
+    : null;
+  const sequenceLabel = h3SequenceLabel(plan?.items ?? [], selectedIds);
+  const planReady = Boolean(
+    plan?.current && !dirty && selectedIds.length && !selectionIssue,
+  );
 
   const toggleItem = (item: VideoProductionPlanItem) => {
     if (!item.ready) return;
@@ -141,7 +188,7 @@ export function VideoWorkspace({
   };
 
   const savePlan = async () => {
-    if (!project || !plan || !selectedIds.length) return;
+    if (!project || !plan || !selectedIds.length || selectionIssue) return;
     setSaving(true);
     setError(null);
     try {
@@ -247,6 +294,7 @@ export function VideoWorkspace({
       </header>
 
       {error ? <div className="source-alert">{error}</div> : null}
+      {selectionIssue ? <div className="video-stale-warning" role="alert">{selectionIssue}</div> : null}
 
       {loading ? (
         <section className="video-loading"><LoaderCircle className="spinning" size={24} /> 正在整理视频生产资料…</section>
@@ -274,7 +322,9 @@ export function VideoWorkspace({
           <section className="video-plan-toolbar">
             <div>
               <strong>视频生产预检</strong>
-              <span>保存清单不消耗额度；生成时连续分镜自动合并，每条固定 30 秒并按条计费。</span>
+              <span>{isComfyVideo
+                ? "H3 会逐组生成 15 秒视频；每组完成后自动把终帧交给下一组，前序失败即暂停。"
+                : "保存清单不消耗额度；生成时连续分镜自动合并，每条固定 30 秒并按条计费。"}</span>
             </div>
             <button className="button secondary compact" type="button" onClick={() => void loadPlan()}>
               <RefreshCw size={15} /> 刷新预检
@@ -284,16 +334,22 @@ export function VideoWorkspace({
               type="button"
               disabled={!readyItems.length}
               onClick={() => {
-                setSelectedIds(readyItems.map((item) => item.id));
+                const episodeNumber = activeItem?.episodeNumber ?? readyItems[0]?.episodeNumber;
+                setSelectedIds(
+                  (isComfyVideo
+                    ? readyItems.filter((item) => item.episodeNumber === episodeNumber)
+                    : readyItems
+                  ).map((item) => item.id),
+                );
                 setDirty(true);
               }}
             >
-              <Check size={15} /> 选择全部可用项
+              <Check size={15} /> {isComfyVideo ? "选择本集可用项" : "选择全部可用项"}
             </button>
             <button
               className="button primary compact"
               type="button"
-              disabled={!selectedIds.length || saving}
+              disabled={!selectedIds.length || saving || Boolean(selectionIssue)}
               onClick={savePlan}
             >
               {saving ? <LoaderCircle className="spinning" size={15} /> : <Save size={15} />}
@@ -399,6 +455,17 @@ export function VideoWorkspace({
             </article>
           </div>
 
+          {isComfyVideo ? (
+            <section className="video-tunnel-card running">
+              <div className="video-tunnel-icon"><Cloud size={22} /></div>
+              <div>
+                <strong>H3 连续批量队列</strong>
+                <p>{sequenceLabel}；按所选顺序逐条生成，后一组自动使用前一组稳定终帧。</p>
+                <small>提交前会检查云机在线状态；前序失败时自动暂停剩余任务。</small>
+              </div>
+              <span className="video-sequence-count">{selectedIds.length} 组 · 每组 15 秒</span>
+            </section>
+          ) : (
           <section className={tunnel?.running ? "video-tunnel-card running" : "video-tunnel-card"}>
             <div className="video-tunnel-icon">
               {tunnel?.running ? <Cloud size={22} /> : <CloudOff size={22} />}
@@ -437,12 +504,17 @@ export function VideoWorkspace({
               </button>
             )}
           </section>
+          )}
 
           <footer className="video-next-step">
             <Film size={21} />
             <div>
               <strong>{videoModelConfigured ? "视频模型已配置" : "下一步：配置视频模型"}</strong>
-              <p>{videoModelConfigured ? `已选 ${selectedIds.length} 个分镜组，预计提交 ${requestCount} 条 30 秒视频；素材通道会自动开启并关闭。` : "先保存服务商、模型和密钥，并进行不会消耗额度的模型列表测试。"}</p>
+              <p>{videoModelConfigured
+                ? isComfyVideo
+                  ? `${sequenceLabel}，将顺序提交 ${requestCount} 条 15 秒 H3 视频。`
+                  : `已选 ${selectedIds.length} 个分镜组，预计提交 ${requestCount} 条 30 秒视频；素材通道会自动开启并关闭。`
+                : "先保存服务商、模型和密钥，并进行不会消耗额度的模型列表测试。"}</p>
             </div>
             <div className="video-next-actions">
               <button className="button secondary compact" type="button" onClick={onOpenApiSettings}>
@@ -452,11 +524,15 @@ export function VideoWorkspace({
                 <button
                   className="button primary compact"
                   type="button"
-                  disabled={queueing || !planReady || !tunnel?.installed}
+                  disabled={queueing || !planReady || (!isComfyVideo && !tunnel?.installed)}
                   onClick={() => void queueVideos()}
                 >
                   {queueing ? <LoaderCircle className="spinning" size={15} /> : <Play size={15} />}
-                  {queueing ? "正在提交…" : `生成 ${requestCount} 条30秒视频（按条计费）`}
+                  {queueing
+                    ? "正在提交…"
+                    : isComfyVideo
+                      ? `顺序生成 ${requestCount} 个镜头组`
+                      : `生成 ${requestCount} 条30秒视频（按条计费）`}
                 </button>
               ) : null}
             </div>

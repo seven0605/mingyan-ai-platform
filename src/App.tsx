@@ -180,6 +180,7 @@ export default function App() {
             onOpenTasks={() => setActivePage("tasks")}
             onPlanReady={() => updateStage("video")}
             videoModelConfigured={videoBackendSettings?.configured ?? false}
+            activeVideoBackend={videoBackendSettings?.activeBackend ?? "api"}
           />
         ) : activePage === "tasks" ? (
           <TaskCenter
