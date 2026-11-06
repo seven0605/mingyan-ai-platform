@@ -3617,11 +3617,7 @@ into the next action inside [Shot 1].
             )
         return comfyui_video_settings()
 
-    @application.post(
-        "/api/settings/comfyui-video/test", response_model=TextModelConnectionOut
-    )
-    def test_comfyui_video_connection() -> TextModelConnectionOut:
-        settings = configured_comfyui_video_settings()
+    def require_comfyui_connection(settings: ComfyUIVideoSettingsOut) -> int:
         started_at = time.perf_counter()
         try:
             with httpx.Client(
@@ -3633,13 +3629,19 @@ into the next action inside [Shot 1].
                 response = client.get(f"{settings.baseUrl}/system_stats")
         except httpx.RequestError as error:
             raise HTTPException(
-                status_code=502, detail=f"无法连接云端 ComfyUI：{type(error).__name__}"
+                status_code=502,
+                detail=(
+                    "云端 ComfyUI 当前不可用，请先启动云机并更新 6006 映射地址："
+                    f"{type(error).__name__}"
+                ),
             ) from error
-        latency_ms = round((time.perf_counter() - started_at) * 1000)
         if not response.is_success:
             raise HTTPException(
                 status_code=502,
-                detail=f"云端 ComfyUI 返回 HTTP {response.status_code}，请检查 6006 映射地址",
+                detail=(
+                    f"云端 ComfyUI 当前不可用（HTTP {response.status_code}），"
+                    "请先启动云机并更新 6006 映射地址"
+                ),
             )
         try:
             payload = response.json()
@@ -3647,6 +3649,14 @@ into the next action inside [Shot 1].
             raise HTTPException(status_code=502, detail="云端地址不是可识别的 ComfyUI 服务") from error
         if not isinstance(payload, dict):
             raise HTTPException(status_code=502, detail="云端地址不是可识别的 ComfyUI 服务")
+        return round((time.perf_counter() - started_at) * 1000)
+
+    @application.post(
+        "/api/settings/comfyui-video/test", response_model=TextModelConnectionOut
+    )
+    def test_comfyui_video_connection() -> TextModelConnectionOut:
+        settings = configured_comfyui_video_settings()
+        latency_ms = require_comfyui_connection(settings)
         return TextModelConnectionOut(
             connected=True,
             model=settings.model,
@@ -4926,6 +4936,7 @@ into the next action inside [Shot 1].
                 raise HTTPException(status_code=409, detail="临时通道正在被其他项目使用")
         else:
             comfy_settings = configured_comfyui_video_settings()
+            require_comfyui_connection(comfy_settings)
             request_seconds = H3_REQUEST_SECONDS
             model_name = comfy_settings.model
             workflow_placeholders = comfyui_workflow_placeholders(
