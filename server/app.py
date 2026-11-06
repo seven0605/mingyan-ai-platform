@@ -9,8 +9,9 @@ import sqlite3
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
@@ -898,10 +899,15 @@ def h3_dialogue_chunks_valid(content: str) -> bool:
     )
 
 
-def connect(database_path: Path) -> sqlite3.Connection:
+@contextmanager
+def connect(database_path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def initialize_database(database_path: Path) -> None:

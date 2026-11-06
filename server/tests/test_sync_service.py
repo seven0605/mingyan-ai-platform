@@ -1,3 +1,4 @@
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 
@@ -8,19 +9,25 @@ from server.sync_service import CrossDeviceSync, SyncConflictError
 
 
 def add_project(database_path: Path, project_id: str, name: str) -> None:
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO projects (
-                id, name, description, stage, created_at, updated_at
-            ) VALUES (?, ?, '', 'text', ?, ?)
-            """,
-            (project_id, name, "2026-11-06T00:00:00+00:00", "2026-11-06T00:00:00+00:00"),
-        )
+    with closing(sqlite3.connect(database_path)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    id, name, description, stage, created_at, updated_at
+                ) VALUES (?, ?, '', 'text', ?, ?)
+                """,
+                (
+                    project_id,
+                    name,
+                    "2026-11-06T00:00:00+00:00",
+                    "2026-11-06T00:00:00+00:00",
+                ),
+            )
 
 
 def project_names(database_path: Path) -> list[str]:
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         return [
             row[0]
             for row in connection.execute("SELECT name FROM projects ORDER BY name")
