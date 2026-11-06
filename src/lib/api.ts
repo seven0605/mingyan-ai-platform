@@ -15,6 +15,7 @@ import type {
   ScriptPlan,
   SourceDocument,
   StoryAnalysis,
+  SyncStatus,
   TextModelConnection,
   TextModelSettings,
   VideoModelSettings,
@@ -178,6 +179,35 @@ export function saveVideoBackend(activeBackend: "api" | "comfyui") {
   return request<VideoBackendSettings>("/api/settings/video-backend", {
     method: "PUT",
     body: JSON.stringify({ activeBackend }),
+  });
+}
+
+export function getSyncStatus() {
+  return request<SyncStatus>("/api/sync/status");
+}
+
+export function saveSyncSettings(input: {
+  folderPath: string;
+  deviceName: string;
+  enabled: boolean;
+}) {
+  return request<SyncStatus>("/api/sync/settings", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function pushSyncSnapshot(force = false) {
+  return request<SyncStatus>("/api/sync/push", {
+    method: "POST",
+    body: JSON.stringify({ force }),
+  });
+}
+
+export function pullSyncSnapshot(force = false) {
+  return request<SyncStatus>("/api/sync/pull", {
+    method: "POST",
+    body: JSON.stringify({ force }),
   });
 }
 

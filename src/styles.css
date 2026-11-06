@@ -2259,6 +2259,131 @@ textarea:focus-visible {
   text-align: right;
 }
 
+.sync-alert {
+  margin-top: 18px;
+}
+
+.sync-overview {
+  margin-top: 24px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.sync-overview > div {
+  min-height: 76px;
+  padding: 14px 16px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--accent-light);
+  background: rgba(16, 18, 26, 0.68);
+}
+
+.sync-overview span {
+  color: #7f8391;
+  font-size: 11px;
+}
+
+.sync-overview strong {
+  grid-column: 2;
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.sync-enable-field {
+  border-color: rgba(149, 140, 255, 0.24);
+  background: rgba(105, 91, 229, 0.07);
+}
+
+.sync-folder-suggestions > span {
+  display: block;
+  margin-bottom: 9px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.sync-folder-suggestions > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.sync-folder-suggestions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted-strong);
+  background: var(--surface-soft);
+  cursor: pointer;
+}
+
+.sync-folder-suggestions button:hover,
+.sync-folder-suggestions button.selected {
+  border-color: var(--accent);
+  color: var(--text);
+  background: rgba(124, 108, 246, 0.12);
+}
+
+.sync-actions {
+  max-width: none;
+  flex-wrap: wrap;
+}
+
+.sync-conflict-actions {
+  margin-top: 18px;
+  padding: 15px;
+  border: 1px solid rgba(227, 191, 131, 0.28);
+  border-radius: 9px;
+  background: rgba(145, 106, 48, 0.08);
+}
+
+.sync-conflict-actions strong {
+  color: #e3bf83;
+  font-size: 13px;
+}
+
+.sync-conflict-actions p {
+  margin: 6px 0 12px;
+  color: #9a9182;
+  font-size: 11px;
+}
+
+.sync-conflict-actions > div {
+  display: flex;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.button.warning {
+  color: #f1cd91;
+  border: 1px solid rgba(227, 191, 131, 0.3);
+  background: rgba(145, 106, 48, 0.12);
+}
+
+.button.warning:hover {
+  border-color: rgba(227, 191, 131, 0.52);
+  background: rgba(145, 106, 48, 0.2);
+}
+
+.button.warning:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+@media (max-width: 900px) {
+  .sync-overview {
+    grid-template-columns: 1fr;
+  }
+}
+
 .placeholder-page {
   min-height: calc(100vh - 58px);
   padding: 60px 34px;

@@ -41,6 +41,7 @@ from server.screenplay_generation import (
 )
 from server.story_analysis import analyze_story
 from server.storyboard_generation import build_storyboard_messages
+from server.sync_service import CrossDeviceSync, SyncConflictError, SyncNotReadyError
 
 ProjectStage = Literal["text", "script", "storyboard", "assets", "video"]
 ProjectName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
@@ -167,6 +168,39 @@ class VideoModelSettingsOut(BaseModel):
     configured: bool
     concurrency: int
     updatedAt: str | None
+
+
+class SyncSettingsUpdate(BaseModel):
+    folderPath: Annotated[
+        str, StringConstraints(strip_whitespace=True, max_length=2000)
+    ]
+    deviceName: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+    ]
+    enabled: bool
+
+
+class SyncActionRequest(BaseModel):
+    force: bool = False
+
+
+class SyncFolderOption(BaseModel):
+    label: str
+    path: str
+
+
+class SyncStatusOut(BaseModel):
+    enabled: bool
+    folderPath: str
+    deviceId: str
+    deviceName: str
+    state: Literal["disabled", "ready", "syncing", "conflict", "error"]
+    dirty: bool
+    lastSyncedAt: str | None
+    latestDeviceName: str
+    latestUpdatedAt: str | None
+    suggestedFolders: list[SyncFolderOption]
+    error: str
 
 
 class ComfyUIVideoSettingsUpdate(BaseModel):
@@ -2006,6 +2040,7 @@ def create_app(
     database_path = resolved_data_dir / "mingyan.sqlite3"
     credentials = credential_store or SystemCredentialStore()
     asset_tunnel = asset_tunnel_service or TemporaryAssetTunnel(resolved_data_dir)
+    sync_service = CrossDeviceSync(resolved_data_dir, database_path)
     batch_guard = threading.Lock()
     active_asset_batches: set[str] = set()
     active_video_batches: set[str] = set()
@@ -2013,6 +2048,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        sync_service.sync_on_startup()
         initialize_database(database_path)
         with connect(database_path) as connection:
             connection.execute(
@@ -2038,13 +2074,79 @@ def create_app(
         try:
             yield
         finally:
+            sync_service.flush()
             asset_tunnel.stop()
 
     application = FastAPI(title="明琰AI平台本地服务", version="0.1.0", lifespan=lifespan)
 
+    @application.middleware("http")
+    async def track_sync_changes(request, call_next):
+        response = await call_next(request)
+        if (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path.startswith("/api/")
+            and not request.url.path.startswith("/api/sync")
+            and not request.url.path.endswith("/test")
+            and response.status_code < 400
+        ):
+            sync_service.mark_dirty()
+        return response
+
     @application.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "version": application.version}
+
+    @application.get("/api/sync/status", response_model=SyncStatusOut)
+    def get_sync_status() -> SyncStatusOut:
+        return SyncStatusOut.model_validate(sync_service.status())
+
+    @application.put("/api/sync/settings", response_model=SyncStatusOut)
+    def update_sync_settings(payload: SyncSettingsUpdate) -> SyncStatusOut:
+        try:
+            sync_service.configure(
+                payload.folderPath, payload.deviceName, payload.enabled
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return SyncStatusOut.model_validate(sync_service.status())
+
+    @application.post("/api/sync/push", response_model=SyncStatusOut)
+    def push_sync_snapshot(payload: SyncActionRequest) -> SyncStatusOut:
+        try:
+            sync_service.push(force=payload.force)
+        except SyncConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (OSError, SyncNotReadyError, sqlite3.Error) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return SyncStatusOut.model_validate(sync_service.status())
+
+    @application.post("/api/sync/pull", response_model=SyncStatusOut)
+    def pull_sync_snapshot(payload: SyncActionRequest) -> SyncStatusOut:
+        with connect(database_path) as connection:
+            active_image = connection.execute(
+                """
+                SELECT id FROM asset_generation_jobs
+                WHERE status IN ('queued', 'running') LIMIT 1
+                """
+            ).fetchone()
+            active_video = connection.execute(
+                """
+                SELECT id FROM video_generation_jobs
+                WHERE status IN ('queued', 'running') LIMIT 1
+                """
+            ).fetchone()
+        if active_image is not None or active_video is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="仍有生成任务正在执行，请等待任务结束后再获取云端版本",
+            )
+        try:
+            sync_service.pull(force=payload.force)
+        except SyncConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (OSError, SyncNotReadyError, sqlite3.Error) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return SyncStatusOut.model_validate(sync_service.status())
 
     def text_model_settings() -> TextModelSettingsOut:
         with connect(database_path) as connection:
@@ -2757,6 +2859,7 @@ into the next action inside [Shot 1].
                     """,
                     (status, provider_task_id, message, utc_now(), job_id),
                 )
+        sync_service.mark_dirty()
 
     def process_generation_batch(batch_id: str) -> None:
         with batch_guard:
@@ -3126,6 +3229,7 @@ into the next action inside [Shot 1].
             return
         if job["backend"] == "comfyui":
             process_comfyui_video_job(job)
+            sync_service.mark_dirty()
             return
 
         provider_task_id = job["provider_task_id"]
@@ -3360,6 +3464,7 @@ into the next action inside [Shot 1].
         finally:
             if tunnel_started:
                 asset_tunnel.stop()
+            sync_service.mark_dirty()
 
     def process_video_batch(batch_id: str) -> None:
         with batch_guard:

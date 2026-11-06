@@ -8,6 +8,7 @@ export type PageId =
   | "tasks"
   | "plugins"
   | "api"
+  | "sync"
   | "library"
   | "export";
 
@@ -109,6 +110,22 @@ export interface VideoBackendSettings {
   apiConfigured: boolean;
   comfyuiConfigured: boolean;
   updatedAt: string | null;
+}
+
+export type SyncState = "disabled" | "ready" | "syncing" | "conflict" | "error";
+
+export interface SyncStatus {
+  enabled: boolean;
+  folderPath: string;
+  deviceId: string;
+  deviceName: string;
+  state: SyncState;
+  dirty: boolean;
+  lastSyncedAt: string | null;
+  latestDeviceName: string;
+  latestUpdatedAt: string | null;
+  suggestedFolders: Array<{ label: string; path: string }>;
+  error: string;
 }
 
 export interface ScriptCharacter {

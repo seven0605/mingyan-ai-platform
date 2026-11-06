@@ -1,6 +1,7 @@
 import {
   Boxes,
   Clapperboard,
+  Cloud,
   Code2,
   FileText,
   Film,
@@ -32,6 +33,7 @@ const NAVIGATION: NavigationItem[] = [
   { id: "tasks", label: "任务中心", icon: FolderKanban, dividerBefore: true },
   { id: "plugins", label: "插件管理", icon: Plug },
   { id: "api", label: "API 设置", icon: Code2 },
+  { id: "sync", label: "跨设备同步", icon: Cloud },
   { id: "library", label: "素材库", icon: Library, dividerBefore: true },
   { id: "export", label: "成片导出", icon: PackageOpen },
 ];
@@ -67,7 +69,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
 
       <div className="sidebar-footer">
         <Film size={16} strokeWidth={1.7} />
-        <span>项目与素材保存在本机</span>
+        <span>本机存储 · 支持跨设备同步</span>
       </div>
     </aside>
   );

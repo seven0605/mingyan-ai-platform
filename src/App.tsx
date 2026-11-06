@@ -6,6 +6,7 @@ import { PlaceholderPage } from "./components/PlaceholderPage";
 import { Sidebar } from "./components/Sidebar";
 import { SourceEditor } from "./components/SourceEditor";
 import { StoryboardWorkspace } from "./components/StoryboardWorkspace";
+import { SyncSettings } from "./components/SyncSettings";
 import { TaskCenter } from "./components/TaskCenter";
 import { TopBar } from "./components/TopBar";
 import { VideoWorkspace } from "./components/VideoWorkspace";
@@ -35,6 +36,7 @@ const PAGE_TITLES: Record<Exclude<PageId, "workspace" | "source">, string> = {
   tasks: "任务中心",
   plugins: "插件管理",
   api: "API 设置",
+  sync: "跨设备同步",
   library: "素材库",
   export: "成片导出",
 };
@@ -182,6 +184,8 @@ export default function App() {
             videoModelConfigured={videoBackendSettings?.configured ?? false}
             activeVideoBackend={videoBackendSettings?.activeBackend ?? "api"}
           />
+        ) : activePage === "sync" ? (
+          <SyncSettings />
         ) : activePage === "tasks" ? (
           <TaskCenter
             project={currentProject}
