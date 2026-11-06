@@ -219,6 +219,14 @@
       "ref_images.ref_image_1": [
         "150",
         0
+      ],
+      "ref_images.ref_image_2": [
+        "161",
+        0
+      ],
+      "ref_images.ref_image_3": [
+        "162",
+        0
       ]
     },
     "class_type": "MiniMaxH3ReferenceToVideo",
@@ -317,6 +325,24 @@
     "class_type": "H3StreamedBlocks",
     "_meta": {
       "title": "H3 Streamed Blocks (exact low-VRAM)"
+    }
+  },
+  "161": {
+    "inputs": {
+      "image": "{{reference_3}}"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "LoadImage (Picture 3)"
+    }
+  },
+  "162": {
+    "inputs": {
+      "image": "{{reference_4}}"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "LoadImage (Picture 4)"
     }
   }
 }

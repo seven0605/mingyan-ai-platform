@@ -54,6 +54,9 @@ CHAPTER_HEADING = re.compile(
 VIDEO_REQUEST_SECONDS = 30
 H3_REQUEST_SECONDS = 15
 COMFYUI_PLACEHOLDER = re.compile(r"\{\{([a-z0-9_]+)\}\}")
+H3_DIRECTOR_STORYBOARD_SKILL = (
+    Path(__file__).parent / "prompts" / "h3-director-storyboard-skill-zh.txt"
+).read_text(encoding="utf-8")
 
 
 class ProjectCreate(BaseModel):
@@ -854,18 +857,45 @@ def h3_authoritative_source(prompt: str) -> str:
     return prompt[start:].strip() if start >= 0 else prompt.strip()
 
 
+def h3_exact_dialogue_contract(prompt: str) -> str:
+    match = re.search(
+        r"【关键对白】\s*(.*?)(?=\n\s*【|\Z)", prompt, flags=re.DOTALL
+    )
+    return match.group(1).strip() if match else ""
+
+
+def h3_dialogue_contract_lines(contract: str) -> list[str]:
+    return [
+        dialogue.strip()
+        for dialogue in re.findall(r"[：:]\s*[“\"]([^”\"\n]+)[”\"]", contract)
+        if dialogue.strip()
+    ]
+
+
+def h3_dialogue_contract_valid(content: str, required_lines: list[str]) -> bool:
+    spoken = "".join(re.findall(r"<d>(.*?)</d>", content, flags=re.DOTALL))
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[\s“”\"']+", "", value)
+
+    normalized_spoken = normalize(spoken)
+    return all(normalize(line) in normalized_spoken for line in required_lines)
+
+
 def h3_shot_density_valid(content: str, seconds: int) -> bool:
-    if seconds < 10:
-        return True
-    shot_count = len(re.findall(r"(?m)^\[Shot \d+\]", content))
-    return 5 <= shot_count <= 7
+    shot_numbers = [
+        int(value) for value in re.findall(r"(?m)^\[Shot (\d+)\]", content)
+    ]
+    return bool(shot_numbers) and shot_numbers == list(
+        range(1, len(shot_numbers) + 1)
+    )
 
 
 def h3_dialogue_chunks_valid(content: str) -> bool:
-    for dialogue in re.findall(r"<d>(.*?)</d>", content, flags=re.DOTALL):
-        if len(re.findall(r"[\u4e00-\u9fff]", dialogue)) > 20:
-            return False
-    return True
+    return all(
+        dialogue.strip()
+        for dialogue in re.findall(r"<d>(.*?)</d>", content, flags=re.DOTALL)
+    )
 
 
 def connect(database_path: Path) -> sqlite3.Connection:
@@ -1489,6 +1519,25 @@ def h3_batch_sequence_error(items: list[VideoProductionPlanItem]) -> str:
     return ""
 
 
+def h3_plan_items_share_scene(
+    previous: VideoProductionPlanItem | None,
+    current: VideoProductionPlanItem,
+) -> bool:
+    if previous is None or previous.episodeNumber != current.episodeNumber:
+        return False
+    previous_scene_ids = {
+        reference.assetId
+        for reference in previous.assetReferences
+        if reference.kind == "scene"
+    }
+    current_scene_ids = {
+        reference.assetId
+        for reference in current.assetReferences
+        if reference.kind == "scene"
+    }
+    return bool(previous_scene_ids & current_scene_ids)
+
+
 def build_video_batch_prompt(
     items: list[VideoProductionPlanItem],
     request_seconds: int = VIDEO_REQUEST_SECONDS,
@@ -1545,6 +1594,24 @@ def fit_h3_references(
     identities = [
         reference for reference in references if reference.get("role") == "identity"
     ]
+    if not continuity:
+        scene_states = [
+            reference
+            for reference in states
+            if reference.get("assetKind") == "scene"
+        ]
+        if scene_states:
+            non_scene_states = [
+                reference
+                for reference in states
+                if reference.get("assetKind") != "scene"
+            ]
+            states = [
+                *non_scene_states[: max(required_count - 1, 0)],
+                scene_states[0],
+                *non_scene_states[max(required_count - 1, 0) :],
+                *scene_states[1:],
+            ]
     selected = [
         dict(reference)
         for reference in [*continuity, *states, *identities][:required_count]
@@ -2216,17 +2283,34 @@ def create_app(
                 )
                 reference_lines.append(
                     f"<Picture {index}>: {reference['name']} ({role}); preserve this asset's "
-                    "identity, production design, costume, material, and visible state."
+                    "identity, production design, costume, material, and visible state. "
+                    "The text compiler cannot inspect this picture: do not infer or name "
+                    "any unverified facial trait, hairstyle, color, garment, accessory, "
+                    "injury, prop detail, or material."
                 )
-        source_timeline = "\n\n".join(
-            f"Target 00:00.000-00:{item.durationSeconds:06.3f}, Episode "
-            f"{item.episodeNumber}, shot group {item.groupIndex}, purpose: "
-            f"{item.purpose}\n{h3_authoritative_source(item.prompt)}"
-            for item in items
-        )
+        source_timeline_parts = []
+        required_dialogue_lines: list[str] = []
+        for item in items:
+            dialogue_contract = h3_exact_dialogue_contract(item.prompt)
+            required_dialogue_lines.extend(
+                h3_dialogue_contract_lines(dialogue_contract)
+            )
+            source_timeline_parts.append(
+                f"Target 00:00.000-00:{item.durationSeconds:06.3f}, Episode "
+                f"{item.episodeNumber}, shot group {item.groupIndex}, purpose: "
+                f"{item.purpose}\n{h3_authoritative_source(item.prompt)}"
+                + (
+                    "\n\nEXACT DIALOGUE CONTRACT — copy every spoken line "
+                    "verbatim and in order:\n"
+                    + dialogue_contract
+                    if dialogue_contract
+                    else ""
+                )
+            )
+        source_timeline = "\n\n".join(source_timeline_parts)
         literal_locks = extract_h3_literal_locks([item.prompt for item in items])
         literal_lock_block = "\n".join(literal_locks)
-        system_prompt = """
+        system_prompt = f"""
 You are a MiniMax H3 Ref2VA prompt compiler. Return only one production prompt in
 the exact six-section order below, with the section labels written exactly as shown:
 subject_definitions:, summary:, retention_analysis:, detailed_description:,
@@ -2245,22 +2329,37 @@ changing colors, materials, injuries, hair, or accessories. Those lines override
 all conflicting visual prose in the source timeline.
 
 The target is exactly 15 seconds unless another duration is explicitly supplied.
-Write 350-500 English words in detailed_description. [Shot 1] has no timestamp;
-every later shot begins with [Shot N] At MM:SS.mmm. Each cut must change camera
-angle by at least 30 degrees and skip at least one shot-size rung while preserving
-the 180-degree axis. If a requested cut would violate this, insert a reaction,
-object, or environmental cutaway. Describe composition, positions, appearance,
-lighting, physical actions and state changes, camera movement, sound, and the exact
-moment each reference takes effect. Keep actions physically plausible. Do not add
-new characters, events, props, or dialogue. No Markdown fences and no commentary.
-For every 10-15 second target, detailed_description must contain 5-7 shots. Keep
-each shot between 2 and 4 seconds and never longer than 5 seconds. If one spoken
-line would occupy more than 4 seconds, preserve that dialogue verbatim while using
-a reaction shot, an object/action insert, or an environmental cutaway to break up
-the direct-to-camera coverage. Split long Chinese dialogue verbatim across consecutive
-<d> blocks in those shots, keeping every block at no more than 20 Chinese characters;
-never place the entire long line in one shot. Never pad the duration with a freeze,
-repeated action, reset, or redundant restaging.
+Shot count and shot duration must be decided from the dramatic unit, dialogue timing,
+physical action chain, and the authoritative director skill below; never use a fixed
+shot quota. [Shot 1] has no timestamp; every later shot begins with [Shot N] At
+MM:SS.mmm. Before [Shot 1], detailed_description must state the visual strategy:
+emotion curve, primary camera motivation, and shot-size strategy. Every shot must
+explicitly contain: 出场, blocking, start state, composition, one motivated camera
+movement with complete start/move/settle timing (or a locked-off camera), the
+action-reaction-consequence chain, visible performance, exact dialogue and sound,
+and end state. The end state of one shot is the start state of the next shot.
+
+The supplied pictures are the sole authority for identity, body, face, hairstyle,
+costume, accessories, injury state, and production design. Define them once in
+subject_definitions and do not redescribe those traits in detailed_description.
+Because the text compiler cannot inspect picture pixels, subject_definitions must
+not infer visual traits from generic period knowledge or conflicting source prose.
+Unless an exact trait is supplied by an IMMUTABLE IDENTITY AND WARDROBE CONTRACT,
+define the subject only by name and state that <Picture N> is the sole visual
+authority. Never guess a hairstyle, color, garment, accessory, injury, material,
+age, body type, weapon design, or architectural detail.
+Only write a visual change when the change physically occurs in that shot. Keep the
+180-degree axis, screen direction, eyelines, actor coordinates, prop ownership,
+light direction, and spatial containers continuous. Use concrete photographable
+actions, never idioms, metaphors, literary commentary, or abstract emotion labels.
+Do not add new characters, locations, events, props, dialogue, subtitles, overlays,
+or screen text. Keep all original Chinese dialogue verbatim and split it only at a
+natural semantic boundary justified by timing; never split by a fixed character
+count. Every line in an EXACT DIALOGUE CONTRACT is authoritative: copy its Chinese
+characters and punctuation verbatim, in the listed order, without synonymizing,
+shortening, expanding, or inventing another line. Use no non-diegetic music unless
+the source explicitly requires it. No
+Markdown fences and no commentary.
 
 When <Picture 1> is an exact first-frame anchor, you cannot inspect its pixels.
 Never claim it shows a particular person, pose, prop, framing, or action unless that
@@ -2273,6 +2372,29 @@ description. Dedicate [Shot 1] only to this 0.8-1.0 second continuity bridge. Be
 the first new requested action at [Shot 2] after 0.8-1.0 seconds with an explicit
 cut that preserves the axis. Never blend, morph, or teleport from the anchor image
 into the next action inside [Shot 1].
+
+The following Chinese director skill is authoritative for segmentation, blocking,
+performance, composition, camera movement, lighting, transitions, dialogue timing,
+physical continuity, and final self-check. It overrides any legacy fixed shot-count
+or fixed dialogue-length convention, but it does not override the required six-section
+wrapper, <Picture N>/<Subject N> syntax, Chinese <d> dialogue tags, or requested total
+duration:
+
+{H3_DIRECTOR_STORYBOARD_SKILL}
+
+FINAL OUTPUT CONTRACT — THIS IS THE LAST AND HIGHEST-PRIORITY FORMATTING RULE:
+Apply every director rule above internally, but return only the MiniMax H3 production
+prompt. The first six top-level labels must appear once, lowercase, unnumbered, and in
+this exact order with no heading before subject_definitions:
+subject_definitions:
+summary:
+retention_analysis:
+detailed_description:
+overall_soundscape:
+non_diegetic_music:
+Inside detailed_description, write the visual strategy first and then sequential
+[Shot 1], [Shot 2]... blocks. Do not output analysis, checklists, explanations, a
+Chinese screenplay table, Markdown headings, or the SKILL text itself.
 """.strip()
         summary_prefix = (
             "[keyframe completion + reference generation]"
@@ -2304,42 +2426,55 @@ into the next action inside [Shot 1].
             + "\n\nSOURCE TIMELINE\n"
             + source_timeline
         )
-        try:
-            with httpx.Client(
-                transport=model_transport, timeout=240, follow_redirects=True
-            ) as client:
-                response = client.post(
-                    chat_url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": settings.model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        "temperature": 0.2,
-                        "max_tokens": 6000,
-                    },
+        def request_compiled_prompt(
+            messages: list[dict[str, str]], temperature: float
+        ) -> str:
+            try:
+                with httpx.Client(
+                    transport=model_transport, timeout=240, follow_redirects=True
+                ) as client:
+                    response = client.post(
+                        chat_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": settings.model,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "max_tokens": 6000,
+                        },
+                    )
+            except httpx.RequestError as error:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"H3 提示词编译请求失败：{type(error).__name__}",
+                ) from error
+            if not response.is_success:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"H3 提示词编译失败（HTTP {response.status_code}）",
                 )
-        except httpx.RequestError as error:
-            raise HTTPException(
-                status_code=502,
-                detail=f"H3 提示词编译请求失败：{type(error).__name__}",
-            ) from error
-        if not response.is_success:
-            raise HTTPException(
-                status_code=502,
-                detail=f"H3 提示词编译失败（HTTP {response.status_code}）",
-            )
-        try:
-            content = str(response.json()["choices"][0]["message"]["content"]).strip()
-        except (KeyError, IndexError, TypeError, ValueError) as error:
-            raise HTTPException(status_code=502, detail="H3 提示词编译结果无法识别") from error
-        if content.startswith("```") and content.endswith("```"):
-            content = re.sub(r"^```(?:text)?\s*|\s*```$", "", content).strip()
+            try:
+                compiled = str(
+                    response.json()["choices"][0]["message"]["content"]
+                ).strip()
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                raise HTTPException(
+                    status_code=502, detail="H3 提示词编译结果无法识别"
+                ) from error
+            if compiled.startswith("```") and compiled.endswith("```"):
+                compiled = re.sub(
+                    r"^```(?:text)?\s*|\s*```$", "", compiled
+                ).strip()
+            return compiled
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        content = request_compiled_prompt(messages, 0.2)
         required_sections = (
             "subject_definitions:",
             "summary:",
@@ -2350,7 +2485,31 @@ into the next action inside [Shot 1].
         )
         positions = [content.find(section) for section in required_sections]
         if any(position < 0 for position in positions) or positions != sorted(positions):
-            raise HTTPException(status_code=502, detail="H3 提示词缺少官方六段结构")
+            content = request_compiled_prompt(
+                [
+                    *messages,
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Reformat the same director plan now. Return only the H3 "
+                            "prompt with exactly these six lowercase top-level labels in "
+                            "order: subject_definitions:, summary:, retention_analysis:, "
+                            "detailed_description:, overall_soundscape:, "
+                            "non_diegetic_music:. Keep the director decisions and exact "
+                            "Chinese dialogue; output no explanation or extra heading."
+                        ),
+                    },
+                ],
+                0.0,
+            )
+            positions = [content.find(section) for section in required_sections]
+            if any(position < 0 for position in positions) or positions != sorted(
+                positions
+            ):
+                raise HTTPException(
+                    status_code=502, detail="H3 提示词缺少官方六段结构"
+                )
         if literal_lock_block:
             content = content.replace(
                 "summary:",
@@ -2360,12 +2519,17 @@ into the next action inside [Shot 1].
         if not h3_shot_density_valid(content, seconds):
             raise HTTPException(
                 status_code=502,
-                detail="H3 提示词未达到每15秒5至7个微镜头的硬性标准，请重试",
+                detail="H3 提示词镜头编号不连续，请重试",
             )
         if not h3_dialogue_chunks_valid(content):
             raise HTTPException(
                 status_code=502,
-                detail="H3 长对白未按反应镜头拆分，请重试",
+                detail="H3 提示词包含空对白块，请重试",
+            )
+        if not h3_dialogue_contract_valid(content, required_dialogue_lines):
+            raise HTTPException(
+                status_code=502,
+                detail="H3 提示词未逐字保留关键对白，请重试",
             )
         content = enforce_h3_axis_continuity(content)
         return apply_h3_continuity_override(content, has_continuity)
@@ -5234,6 +5398,9 @@ into the next action inside [Shot 1].
                 default=0,
             )
         selected_items = selected_video_plan_items(project_id)
+        storyboard_rows, asset_row, _ = video_plan_inputs(project_id)
+        all_plan_items, _, _ = build_video_plan_items(storyboard_rows, asset_row)
+        all_plan_items_by_id = {item.id: item for item in all_plan_items}
         if backend.activeBackend == "comfyui":
             sequence_error = h3_batch_sequence_error(selected_items)
             if sequence_error:
@@ -5281,6 +5448,7 @@ into the next action inside [Shot 1].
                                 {
                                     "logicalId": identity_logical_id,
                                     "assetId": reference.assetId,
+                                    "assetKind": reference.kind,
                                     "imageId": reference.identityMasterId,
                                     "name": reference.name,
                                     "role": "identity",
@@ -5299,6 +5467,7 @@ into the next action inside [Shot 1].
                             {
                                 "logicalId": logical_id,
                                 "assetId": reference.assetId,
+                                "assetKind": reference.kind,
                                 "imageId": reference.imageId,
                                 "name": reference.name,
                                 "role": "state",
@@ -5352,33 +5521,47 @@ into the next action inside [Shot 1].
                             status_code=409,
                             detail="请先完成并验收上一镜头组或上一集末镜头组，再生成当前 H3 视频",
                         )
-                    video_dir = resolved_data_dir / "generated" / project_id / "videos"
-                    previous_frame = video_dir / f"{previous_job['id']}-last-frame.png"
-                    if not pending_previous_id and not previous_frame.is_file():
-                        previous_video = video_dir / f"{previous_job['id']}.mp4"
-                        if previous_video.is_file():
-                            extract_video_terminal_frame(previous_video, previous_frame)
-                    if not pending_previous_id and not previous_frame.is_file():
-                        raise HTTPException(
-                            status_code=409,
-                            detail="上一镜头组缺少稳定终帧，暂不能生成下一条视频",
-                        )
-                    references.insert(
-                        0,
-                        {
-                            "logicalId": f"continuity:{previous_job['id']}",
-                            "assetId": "",
-                            "imageId": previous_job["id"],
-                            "name": (
-                                f"上一镜头组 {first_item.groupIndex - 1} 稳定终帧"
-                                if first_item.groupIndex > 1
-                                else f"上一集末镜头组 {previous_job['plan_item_id']} 稳定终帧"
-                            ),
-                            "role": "continuity",
-                            "sourceJobId": previous_job["id"],
-                            "itemIds": [item.id for item in items],
-                        },
+                    previous_item = all_plan_items_by_id.get(
+                        previous_job["plan_item_id"]
                     )
+                    if h3_plan_items_share_scene(previous_item, first_item):
+                        video_dir = (
+                            resolved_data_dir / "generated" / project_id / "videos"
+                        )
+                        previous_frame = (
+                            video_dir / f"{previous_job['id']}-last-frame.png"
+                        )
+                        if not pending_previous_id and not previous_frame.is_file():
+                            previous_video = video_dir / f"{previous_job['id']}.mp4"
+                            if previous_video.is_file():
+                                extract_video_terminal_frame(
+                                    previous_video, previous_frame
+                                )
+                        if not pending_previous_id and not previous_frame.is_file():
+                            raise HTTPException(
+                                status_code=409,
+                                detail="上一镜头组缺少稳定终帧，暂不能生成下一条视频",
+                            )
+                        references.insert(
+                            0,
+                            {
+                                "logicalId": f"continuity:{previous_job['id']}",
+                                "assetId": "",
+                                "imageId": previous_job["id"],
+                                "name": (
+                                    "上一镜头组 "
+                                    f"{first_item.groupIndex - 1} 稳定终帧"
+                                    if first_item.groupIndex > 1
+                                    else (
+                                        "上一集末镜头组 "
+                                        f"{previous_job['plan_item_id']} 稳定终帧"
+                                    )
+                                ),
+                                "role": "continuity",
+                                "sourceJobId": previous_job["id"],
+                                "itemIds": [item.id for item in items],
+                            },
+                        )
                 if backend.activeBackend == "comfyui":
                     priority_text = "\n".join(
                         f"{item.purpose}\n{item.prompt}" for item in items

@@ -15,6 +15,10 @@ from server.app import (
     comfyui_history_error,
     create_app,
     enforce_h3_axis_continuity,
+    h3_dialogue_contract_lines,
+    h3_dialogue_contract_valid,
+    h3_exact_dialogue_contract,
+    h3_plan_items_share_scene,
     extract_h3_literal_locks,
     fit_h3_references,
     h3_authoritative_source,
@@ -181,6 +185,52 @@ def test_h3_reference_slots_prioritize_distinct_state_images_and_pad() -> None:
         "state:c",
     ]
 
+    cross_scene = fit_h3_references(
+        [
+            {"logicalId": "state:a", "role": "state", "name": "甲", "assetKind": "character"},
+            {"logicalId": "state:b", "role": "state", "name": "乙", "assetKind": "character"},
+            {"logicalId": "state:c", "role": "state", "name": "丙", "assetKind": "character"},
+            {"logicalId": "state:d", "role": "state", "name": "群演", "assetKind": "character"},
+            {"logicalId": "state:scene", "role": "state", "name": "新场景", "assetKind": "scene"},
+        ],
+        4,
+    )
+    assert [item["logicalId"] for item in cross_scene] == [
+        "state:a",
+        "state:b",
+        "state:c",
+        "state:scene",
+    ]
+
+
+def test_h3_terminal_frame_is_used_only_when_scene_asset_matches() -> None:
+    previous = VideoProductionPlanItem(
+        id="e1-g1",
+        episodeNumber=1,
+        episodeTitle="测试",
+        groupIndex=1,
+        sceneIndex=1,
+        durationSeconds=15,
+        aspectRatio="16:9",
+        targetModel="seedance-2.0",
+        purpose="",
+        prompt="",
+        assetReferences=[],
+        blockingReasons=[],
+        ready=True,
+    )
+    scene_a = type("SceneRef", (), {"assetId": "scene-a", "kind": "scene"})()
+    scene_b = type("SceneRef", (), {"assetId": "scene-b", "kind": "scene"})()
+    same_scene = previous.model_copy(update={"assetReferences": [scene_a]})
+    current_same = previous.model_copy(
+        update={"id": "e1-g2", "groupIndex": 2, "assetReferences": [scene_a]}
+    )
+    current_other = previous.model_copy(
+        update={"id": "e1-g3", "groupIndex": 3, "assetReferences": [scene_b]}
+    )
+    assert h3_plan_items_share_scene(same_scene, current_same)
+    assert not h3_plan_items_share_scene(same_scene, current_other)
+
 
 def test_comfyui_history_error_detects_failed_incomplete_job() -> None:
     status = {
@@ -250,17 +300,41 @@ def test_h3_authoritative_source_drops_duplicate_storyboard_prose() -> None:
     )
 
 
-def test_h3_shot_density_requires_five_to_seven_shots_for_fifteen_seconds() -> None:
-    five_shots = "\n".join(f"[Shot {index}]" for index in range(1, 6))
-    assert h3_shot_density_valid(five_shots, 15)
-    assert not h3_shot_density_valid("[Shot 1]\n[Shot 2]\n[Shot 3]", 15)
+def test_h3_exact_dialogue_contract_is_preserved_across_chunks() -> None:
+    prompt = (
+        "【模型执行主提示词】动作摘要\n\n"
+        "【关键对白】萧云衡：“你身边居然有暗影卫？”\n"
+        "云子姝：“萧家容不下我，本公主自己退出。”\n\n"
+        "【禁止项】不要换装"
+    )
+    contract = h3_exact_dialogue_contract(prompt)
+    lines = h3_dialogue_contract_lines(contract)
+    assert lines == [
+        "你身边居然有暗影卫？",
+        "萧家容不下我，本公主自己退出。",
+    ]
+    compiled = (
+        "(S1) <d>你身边居然有暗影卫？</d>"
+        "(S2) <d>萧家容不下我，</d><d>本公主自己退出。</d>"
+    )
+    assert h3_dialogue_contract_valid(compiled, lines)
+    assert not h3_dialogue_contract_valid(
+        "(S1) <d>你身边有暗影卫？</d>", lines
+    )
 
 
-def test_h3_dialogue_chunks_limit_long_chinese_lines() -> None:
+def test_h3_shot_density_allows_director_led_count_with_sequential_numbers() -> None:
+    assert h3_shot_density_valid("[Shot 1]\n[Shot 2]\n[Shot 3]", 15)
+    assert h3_shot_density_valid("[Shot 1]", 15)
+    assert not h3_shot_density_valid("[Shot 1]\n[Shot 3]", 15)
+
+
+def test_h3_dialogue_chunks_preserve_natural_length_and_reject_empty_blocks() -> None:
     assert h3_dialogue_chunks_valid("(S1) <d>短句对白。</d>")
-    assert not h3_dialogue_chunks_valid(
+    assert h3_dialogue_chunks_valid(
         "(S1) <d>这是一句明显超过四秒而且没有拆分到反应镜头里的中文长对白内容。</d>"
     )
+    assert not h3_dialogue_chunks_valid("(S1) <d>   </d>")
 
 
 def test_comfyui_h3_connector_runs_workflow_and_downloads_video(tmp_path: Path) -> None:

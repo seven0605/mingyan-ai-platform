@@ -28,14 +28,14 @@ Pika H3 Flex 的官方 Ref2VA 路径已在当前 RTX 5090 云机上以 768p 跑�
 
 ## 工作流关键参数
 
-- 模式：Ref2VA，双参考图。
+- 模式：Ref2VA，平台模板由已验证的双参考图扩展为四参考图，以容纳续镜终帧、人物状态和场景资产。
 - 画幅：16:9。
 - 分辨率选择：0.98 megapixels、32 倍数对齐，实际输出 `1344×768`。
 - 时长：`{{seconds}}`，本次正式验证 15 秒。
 - 采样器：LCM。
 - Sigmas：`1.0, 0.972973, 0.923077, 0.8, 0.571429, 0.333333, 0.0`。
 - LoRA 强度：1.0。
-- 平台占位符：`{{prompt}}`、`{{reference_1}}`、`{{reference_2}}`、`{{seconds}}`、`{{seed}}`。
+- 平台占位符：`{{prompt}}`、`{{reference_1}}`、`{{reference_2}}`、`{{reference_3}}`、`{{reference_4}}`、`{{seconds}}`、`{{seed}}`。
 - 低显存块：Q/KV/MLP 均为 8192，KV 存储为 BF16 exact。
 - `final_layer_chunk` 必须保持为 `0`。云机自带 MAINodes 的分块末层补丁与当前 ComfyUI H3 结构不兼容，启用时会报 `Tensor object has no attribute adaln_proj`。
 - `trim_forward` 在当前 ComfyUI 版本因源码哈希变化被自动跳过；这是一条警告，不影响成功生成。
@@ -73,7 +73,7 @@ Pika H3 Flex 的官方 Ref2VA 路径已在当前 RTX 5090 云机上以 768p 跑�
 ## 平台接入状态
 
 - 明琰AI的当前视频通道已保持为 `comfyui`。
-- 当前工作流名称：`Pika H3 Flex · Ref2VA · 768p · 双参考图（5–15秒）`。
+- 当前工作流名称：`Pika H3 Flex · Ref2VA · 768p · 四参考图（5–15秒）`。
 - 配置保存后，平台的 ComfyUI 连接与工作流校验通过，测试延迟 675ms。
 - 生产任务会把提示词、两张参考图、时长和种子替换进工作流，再由 `/prompt`、`/history` 与 `/view` 完成提交、恢复和下载。
 - 云机地址属于临时实例配置，不写入公开仓库；实例重建或映射地址变化后，只需在平台设置页更新地址。
