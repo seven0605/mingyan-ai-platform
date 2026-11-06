@@ -41,6 +41,7 @@
 - 睡哭了视频模型配置：预填 `https://shuikule.top/v1` 与 `BD Seedance2.5`，密钥只进入系统凭据库；连接测试仅读取模型列表，不创建视频任务
 - 双视频通道：可在现有 BD Seedance2.5 API 与自有云端 ComfyUI MiniMax H3 之间切换；两套配置独立保存，已入队任务锁定创建时的通道
 - ComfyUI H3 连接器：支持导入 API 格式工作流，以 `{{prompt}}`、`{{reference_1}}` 等占位符绑定提示词、参考图、时长、画幅与随机种子；参考图直传云端，任务经 `/prompt`、`/history`、`/view` 完成并把 MP4 下载回本机
+- Pika H3 Flex 768p 工作流：仓库内置已在 RTX 5090 实机验证的 Ref2VA 双参考图模板，15 秒输出为 1344×768、24fps 并带音轨；单卡任务固定串行
 - H3 时长路由：官方开源 H3 单条最长 15 秒，平台自动按 15 秒拆分；BD Seedance2.5 仍保持按条计费更划算的 30 秒合并策略
 - 并发队列：批量生图和独立的视频 API 任务可在“API 设置”中配置 1–8 路并发；图像资产写入采用互斥保护，视频批次共用一条临时素材通道。单卡 H3 与有前后依赖的连续镜头固定串行，API 与 H3 两种通道可同时工作
 - 跨设备接续：macOS 与 Windows 可通过同一个 iCloud、OneDrive、Dropbox 或 Google Drive 目录交换数据库完整快照和生成素材；启动时自动获取新版本，修改后自动推送，检测到两台电脑同时修改时停止覆盖并要求人工选择版本
@@ -100,12 +101,14 @@ docker compose up --build
 ## 云端 ComfyUI H3（可选）
 
 1. 在 AutoDL 等云 GPU 上部署官方 MiniMax H3 与 ComfyUI，并让 ComfyUI 监听平台映射的 `6006` 端口。
-2. 从 ComfyUI 导出“API 格式”工作流 JSON，再在 JSON 中把对应输入值改为 `{{prompt}}`、`{{reference_1}}`、`{{reference_2}}`、`{{seconds}}`、`{{width}}`、`{{height}}` 或 `{{seed}}`。
+2. Pika H3 Flex 用户可直接导入 [`workflows/pika-h3-flex-ref2va-768p.json`](workflows/pika-h3-flex-ref2va-768p.json)；其他 H3 工作流可从 ComfyUI 导出“API 格式” JSON，再把对应输入值改为 `{{prompt}}`、`{{reference_1}}`、`{{reference_2}}`、`{{seconds}}`、`{{width}}`、`{{height}}` 或 `{{seed}}`。
 3. 在“API 设置 → 视频生成模型”选择“云端 ComfyUI H3”，填写 6006 HTTP 映射地址并导入 JSON。
 4. AutoDL 地址如使用自签名证书，明确勾选“允许当前云机使用自签名 HTTPS 证书”；该开关只作用于这一个 ComfyUI 地址。
 5. 保存后先执行免生成连接测试。测试只读取 `/system_stats`，不会运行 H3 或产生生成任务。
 
 ComfyUI 自托管接口本身默认没有登录保护。不要分享 AutoDL 映射地址，也不要把外部服务密钥直接写入工作流节点。
+
+Pika 模板的云机实测、模型文件、显存参数与已知边界见 [`docs/pika-h3-flex-cloud-test-2026-11-06.md`](docs/pika-h3-flex-cloud-test-2026-11-06.md)。
 
 ## 开发与测试
 
@@ -139,6 +142,7 @@ Windows 对应的虚拟环境 Python 路径是 `.venv\Scripts\python.exe`。
 - `src/`：浏览器前端
 - `server/`：本地 API 与 SQLite 数据层
 - `scripts/`：macOS / Windows 安装与启动脚本
+- `workflows/`：可导入平台的 ComfyUI API 工作流
 - `.github/workflows/ci.yml`：跨平台持续集成
 - `design/`：品牌与界面设计稿
 
