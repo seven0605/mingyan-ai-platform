@@ -6,6 +6,7 @@ import platform
 import shutil
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -169,7 +170,7 @@ class CrossDeviceSync:
         if not self.database_path.is_file():
             return False
         try:
-            with sqlite3.connect(self.database_path) as connection:
+            with closing(sqlite3.connect(self.database_path)) as connection:
                 row = connection.execute("SELECT COUNT(*) FROM projects").fetchone()
             return bool(row and row[0])
         except sqlite3.Error:
@@ -178,7 +179,9 @@ class CrossDeviceSync:
     @staticmethod
     def _validate_database(path: Path) -> None:
         try:
-            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+            with closing(
+                sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            ) as connection:
                 result = connection.execute("PRAGMA quick_check").fetchone()
         except sqlite3.Error as error:
             raise SyncNotReadyError("云端数据库快照无法读取，请等待云盘同步完成") from error
@@ -329,8 +332,8 @@ class CrossDeviceSync:
             device_dir.mkdir(parents=True, exist_ok=True)
             snapshot = device_dir / "mingyan.sqlite3"
             temporary_snapshot = device_dir / f".mingyan.{uuid4().hex}.tmp"
-            with sqlite3.connect(self.database_path) as source:
-                with sqlite3.connect(temporary_snapshot) as destination:
+            with closing(sqlite3.connect(self.database_path)) as source:
+                with closing(sqlite3.connect(temporary_snapshot)) as destination:
                     source.backup(destination)
             self._validate_database(temporary_snapshot)
             os.replace(temporary_snapshot, snapshot)
