@@ -48,6 +48,10 @@ def open_browser_when_ready(health_url: str, app_url: str) -> None:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     port = server_port()
     app_url = f"http://127.0.0.1:{port}/"
     health_url = f"http://127.0.0.1:{port}/api/health"
