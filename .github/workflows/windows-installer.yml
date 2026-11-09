@@ -57,10 +57,18 @@ jobs:
           $env:MINGYAN_DATA_DIR = $DataDir
           $env:MINGYAN_NO_BROWSER = "1"
           $env:MINGYAN_PORT = "8765"
-          $Process = Start-Process "build\windows\dist\MingyanAI\MingyanAI.exe" -PassThru
+          $StdoutLog = Join-Path $env:RUNNER_TEMP "mingyan-portable.stdout.log"
+          $StderrLog = Join-Path $env:RUNNER_TEMP "mingyan-portable.stderr.log"
+          $Process = Start-Process "build\windows\dist\MingyanAI\MingyanAI.exe" -RedirectStandardOutput $StdoutLog -RedirectStandardError $StderrLog -PassThru
           try {
             $Ready = $false
             for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
+              $Process.Refresh()
+              if ($Process.HasExited) {
+                Get-Content $StdoutLog -ErrorAction SilentlyContinue
+                Get-Content $StderrLog -ErrorAction SilentlyContinue
+                throw "Portable application exited with code $($Process.ExitCode)"
+              }
               try {
                 $Health = Invoke-RestMethod "http://127.0.0.1:8765/api/health" -TimeoutSec 1
                 $Home = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/" -TimeoutSec 1
@@ -72,9 +80,15 @@ jobs:
                 Start-Sleep -Milliseconds 500
               }
             }
-            if (-not $Ready) { throw "Portable application failed its health check" }
+            if (-not $Ready) {
+              Get-Content $StdoutLog -ErrorAction SilentlyContinue
+              Get-Content $StderrLog -ErrorAction SilentlyContinue
+              throw "Portable application failed its health check"
+            }
           } finally {
-            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+            if (-not $Process.HasExited) {
+              Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+            }
           }
 
       - name: Install NSIS
@@ -101,10 +115,18 @@ jobs:
           $env:MINGYAN_DATA_DIR = Join-Path $env:RUNNER_TEMP "mingyan-installed-data"
           $env:MINGYAN_NO_BROWSER = "1"
           $env:MINGYAN_PORT = "8766"
-          $Process = Start-Process $InstalledExe -PassThru
+          $StdoutLog = Join-Path $env:RUNNER_TEMP "mingyan-installed.stdout.log"
+          $StderrLog = Join-Path $env:RUNNER_TEMP "mingyan-installed.stderr.log"
+          $Process = Start-Process $InstalledExe -RedirectStandardOutput $StdoutLog -RedirectStandardError $StderrLog -PassThru
           try {
             $Ready = $false
             for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
+              $Process.Refresh()
+              if ($Process.HasExited) {
+                Get-Content $StdoutLog -ErrorAction SilentlyContinue
+                Get-Content $StderrLog -ErrorAction SilentlyContinue
+                throw "Installed application exited with code $($Process.ExitCode)"
+              }
               try {
                 $Health = Invoke-RestMethod "http://127.0.0.1:8766/api/health" -TimeoutSec 1
                 if ($Health.status -eq "ok") {
@@ -115,9 +137,15 @@ jobs:
                 Start-Sleep -Milliseconds 500
               }
             }
-            if (-not $Ready) { throw "Installed application failed its health check" }
+            if (-not $Ready) {
+              Get-Content $StdoutLog -ErrorAction SilentlyContinue
+              Get-Content $StderrLog -ErrorAction SilentlyContinue
+              throw "Installed application failed its health check"
+            }
           } finally {
-            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+            if (-not $Process.HasExited) {
+              Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+            }
           }
           $Uninstaller = Join-Path $env:LOCALAPPDATA "Programs\MingyanAI\Uninstall.exe"
           $UninstallProcess = Start-Process $Uninstaller -ArgumentList "/S" -Wait -PassThru
