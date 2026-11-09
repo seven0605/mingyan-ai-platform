@@ -63,7 +63,7 @@ jobs:
           try {
             $Ready = $false
             $LastProbeError = $null
-            for ($Attempt = 0; $Attempt -lt 240; $Attempt++) {
+            for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
               $Process.Refresh()
               if ($Process.HasExited) {
                 Get-Content $StdoutLog -ErrorAction SilentlyContinue
@@ -72,8 +72,8 @@ jobs:
               }
               try {
                 $Health = Invoke-RestMethod "http://127.0.0.1:8765/api/health" -TimeoutSec 1
-                $Home = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/" -TimeoutSec 1
-                if ($Health.status -eq "ok" -and $Home.StatusCode -eq 200) {
+                $HomeResponse = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/" -TimeoutSec 1
+                if ($Health.status -eq "ok" -and $HomeResponse.StatusCode -eq 200) {
                   $Ready = $true
                   break
                 }
@@ -124,7 +124,7 @@ jobs:
           try {
             $Ready = $false
             $LastProbeError = $null
-            for ($Attempt = 0; $Attempt -lt 240; $Attempt++) {
+            for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
               $Process.Refresh()
               if ($Process.HasExited) {
                 Get-Content $StdoutLog -ErrorAction SilentlyContinue
