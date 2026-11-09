@@ -11,7 +11,7 @@ import {
   ImageOff,
   ListChecks,
   LoaderCircle,
-  Map,
+  Map as MapIcon,
   Palette,
   RefreshCw,
   Save,
@@ -24,6 +24,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   confirmAssetBatchPlan,
   createAssetIdentityMaster,
+  enrichAssetLibrary,
   extractAssetLibrary,
   generateAssetReferenceImage,
   getAssetBatchPlan,
@@ -71,7 +72,7 @@ interface AssetWorkspaceProps {
 
 const KIND_META: Record<AssetKind, { label: string; icon: typeof UserRound }> = {
   character: { label: "角色", icon: UserRound },
-  scene: { label: "场景", icon: Map },
+  scene: { label: "场景", icon: MapIcon },
   prop: { label: "物品", icon: Cuboid },
 };
 
@@ -202,6 +203,7 @@ export function AssetWorkspace({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [extracting, setExtracting] = useState(false);
+  const [enriching, setEnriching] = useState(false);
   const [saving, setSaving] = useState(false);
   const [generatingId, setGeneratingId] = useState<string | null>(null);
   const [previewImageId, setPreviewImageId] = useState<string | null>(null);
@@ -224,6 +226,7 @@ export function AssetWorkspace({
   const [batchSaving, setBatchSaving] = useState(false);
   const [batchQueueing, setBatchQueueing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!project) {
@@ -369,6 +372,7 @@ export function AssetWorkspace({
     if (!project) return;
     setExtracting(true);
     setError(null);
+    setNotice(null);
     try {
       const result = await extractAssetLibrary(project.id);
       setLibrary(result);
@@ -388,6 +392,7 @@ export function AssetWorkspace({
   const updateSelected = (field: keyof AssetItem, value: string) => {
     if (!selectedItem) return;
     setPromptPreview(null);
+    setNotice(null);
     setLibrary((current) => current ? {
       ...current,
       items: current.items.map((item) => (
@@ -409,6 +414,7 @@ export function AssetWorkspace({
     value: AssetVisualStandard | CostumeEra,
   ) => {
     setPromptPreview(null);
+    setNotice(null);
     setLibrary((current) => current ? {
       ...current,
       standard: { ...(current.standard ?? DEFAULT_ASSET_STANDARD), [field]: value },
@@ -459,6 +465,46 @@ export function AssetWorkspace({
     setPromptPreview(null);
     setBatchPlan((current) => current ? { ...current, current: false } : current);
     setError(null);
+    setNotice("已按当前标准重编全部过期提示词；请检查后保存资产。");
+  };
+
+  const handleEnrichAllAssets = async () => {
+    if (!project || !library) return;
+    setEnriching(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await enrichAssetLibrary(project.id, activeStandard);
+      const enrichedById = new Map(result.items.map((item) => [item.id, item]));
+      const signature = assetStandardSignature(activeStandard);
+      setLibrary((current) => current ? {
+        ...current,
+        standard: activeStandard,
+        items: current.items.map((item) => {
+          const enriched = enrichedById.get(item.id);
+          if (!enriched) return item;
+          const detailed = {
+            ...item,
+            description: enriched.description,
+            visualAnchor: enriched.visualAnchor,
+            continuityNotes: enriched.continuityNotes,
+            status: "draft" as const,
+          };
+          return {
+            ...detailed,
+            referencePrompt: compileAssetPrompt(detailed, activeStandard).prompt,
+            promptStandardSignature: signature,
+          };
+        }),
+      } : current);
+      setPromptPreview(null);
+      setBatchPlan((current) => current ? { ...current, current: false } : current);
+      setNotice(`AI 已完善并重编 ${result.items.length} 项资产卡；请抽查后点击“保存资产”。`);
+    } catch (enrichError) {
+      setError(enrichError instanceof Error ? enrichError.message : "AI 资产卡完善失败");
+    } finally {
+      setEnriching(false);
+    }
   };
 
   const toggleConfirmation = () => {
@@ -489,6 +535,7 @@ export function AssetWorkspace({
       setLibrary(result);
       setSavedSignature(editableLibrarySignature(result));
       setBatchPlan((current) => current ? { ...current, current: false } : current);
+      setNotice("资产卡已保存，可以逐项确认后进入生图预检。");
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "资产保存失败");
     } finally {
@@ -752,6 +799,16 @@ export function AssetWorkspace({
               <button
                 className="button secondary compact"
                 type="button"
+                disabled={enriching || !library.items.length}
+                onClick={() => void handleEnrichAllAssets()}
+                title="调用文本模型完善全部角色、场景和道具资产卡；所有资产恢复待确认，参考图保留，不会调用生图模型"
+              >
+                {enriching ? <LoaderCircle className="spinning" size={15} /> : <Sparkles size={15} />}
+                {enriching ? `AI 正在完善 ${library.items.length} 项…` : `AI 完善全部资产卡 ${library.items.length}`}
+              </button>
+              <button
+                className="button secondary compact"
+                type="button"
                 disabled={!stalePromptCount}
                 onClick={handleApplyAllPrompts}
                 title="按当前视觉标准和朝代重编人物、场景与物品提示词；所有资产会恢复为待确认"
@@ -856,6 +913,7 @@ export function AssetWorkspace({
           </section>
 
           {error ? <div className="form-error asset-error">{error}</div> : null}
+          {notice ? <div className="asset-notice">{notice}</div> : null}
 
           <section className="asset-workspace">
             <aside className="asset-catalog" aria-label={`${KIND_META[kind].label}资产列表`}>

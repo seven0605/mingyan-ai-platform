@@ -5,10 +5,10 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 
 !ifndef APP_VERSION
-  !define APP_VERSION "0.1.0-beta.1"
+  !define APP_VERSION "0.1.0-beta.2"
 !endif
 !ifndef APP_VERSION_NUM
-  !define APP_VERSION_NUM "0.1.0.0"
+  !define APP_VERSION_NUM "0.1.0.2"
 !endif
 !ifndef BUILD_DIR
   !error "BUILD_DIR is required"

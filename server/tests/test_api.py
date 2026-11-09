@@ -27,6 +27,7 @@ from server.app import (
     h3_shot_density_valid,
     is_collective_character,
     pack_video_plan_items,
+    unexpected_storyboard_characters,
 )
 from server.asset_tunnel import AssetTunnelStatus, TemporaryAssetTunnel
 from server.storyboard_generation import build_storyboard_messages
@@ -99,6 +100,38 @@ def test_storyboard_prompt_contains_live_action_v5_rules() -> None:
     assert "FACS可见动作" in system_prompt
     assert "同一角色的服装描述跨组必须逐字一致" in system_prompt
     assert "无背景音乐、无BGM、无配乐" in system_prompt
+    assert "当前组唯一允许出镜的角色名单" in system_prompt
+
+
+def test_storyboard_prompt_only_sends_current_scene_and_cast() -> None:
+    messages = build_storyboard_messages(
+        {
+            "episodeNumber": 1,
+            "scenes": [
+                {"index": 1, "characters": ["白晓晓"]},
+                {"index": 2, "characters": ["宋砚洲"]},
+            ],
+        },
+        [{"index": 1, "sceneIndex": 1, "characters": ["白晓晓"]}],
+        "MiniMax H3",
+        "16:9",
+        24,
+    )
+    user_prompt = messages[1]["content"]
+    payload = json.loads(user_prompt[user_prompt.index("{") :])
+    assert payload["episode"]["scenes"] == [
+        {"index": 1, "characters": ["白晓晓"]}
+    ]
+    assert "宋砚洲" not in user_prompt
+    assert "名单外人物" in user_prompt
+
+
+def test_storyboard_cast_check_rejects_only_unlisted_characters() -> None:
+    assert unexpected_storyboard_characters(
+        "白晓晓和宋砚洲站在厨房里。",
+        ["白晓晓", "晓晓", "宋砚洲"],
+        ["白晓晓"],
+    ) == ["宋砚洲"]
 
 
 def test_collective_characters_use_widescreen() -> None:
@@ -849,6 +882,82 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         request_payload = json.loads(request.content)
         assert request_payload["model"] == "example-chat"
         assert "云子姝" in request_payload["messages"][1]["content"]
+        if "影视资产美术总监" in request_payload["messages"][0]["content"]:
+            asset_input = json.loads(request_payload["messages"][1]["content"])
+            enriched_assets = []
+            for item in asset_input["assets"]:
+                if item["kind"] == "character":
+                    description = (
+                        f"{item['name']}是已确认剧本中的核心出镜角色，资产卡用于锁定"
+                        "演员身份、主造型和跨场次连续性，并为后续状态图提供唯一基准。"
+                    )
+                    visual_anchor = (
+                        "二十四岁中国女性，鹅蛋脸与清晰下颌线，平直眉形，深棕杏眼，"
+                        "鼻梁挺直，唇形清楚，暖调自然肤色并保留真实毛孔；黑色长发，"
+                        "身形修长匀称，肩颈舒展；主造型为层次明确的素白中衣、窄袖外层"
+                        "与深色软底鞋，固定银色细簪和右眼尾浅痣作为唯一识别点。"
+                    )
+                    continuity = (
+                        "必须固定脸型、骨相、眼鼻唇比例、右眼尾浅痣、发色、身高和体态；"
+                        "允许随剧情变化的只有服装状态、发型整洁度、伤势和污渍，变化必须"
+                        "由对应场次明确触发。"
+                    )
+                elif item["kind"] == "scene":
+                    description = (
+                        f"{item['name']}是已确认剧本中的主要表演空间，用于承载冲突推进、"
+                        "人物走位和关键道具交互，并作为跨镜头空间连续性的固定基准。"
+                    )
+                    visual_anchor = (
+                        "矩形室内空间，单一木门位于南墙，北墙设高窗，中央保留两米通道；"
+                        "前景为深色木地板，中景固定一张矮榻与方桌，后景为整面木格窗和"
+                        "灰白墙体；旧木、粗布、青砖三种主材质清晰，冷色日光由北窗进入，"
+                        "门框缺角、方桌左侧墨痕和窗下铜灯是三个永久地标。"
+                    )
+                    continuity = (
+                        "必须固定门窗方位、房间比例、矮榻与方桌位置、三处永久地标和主光"
+                        "方向；允许随剧情变化的只有可移动小物、门窗开合、灰尘和局部破坏，"
+                        "已发生的破坏不得自动复原。"
+                    )
+                else:
+                    description = (
+                        f"{item['name']}是已确认剧本中的关键叙事道具，用于承载证据或行动"
+                        "结果，资产卡负责锁定其结构、材质和跨镜头交接时的可辨识性。"
+                    )
+                    visual_anchor = (
+                        "约三十厘米长、二十厘米宽的薄册形道具，长方轮廓，左侧双线装订，"
+                        "封面为暗青色粗纤维纸，内页为微黄宣纸，边角有自然磨损；封面右下"
+                        "压有半枚朱红圆印，装订线第三孔有断线，内页首张存在斜向水痕，"
+                        "三处细节共同构成唯一识别点。"
+                    )
+                    continuity = (
+                        "必须固定整体尺寸、装订孔数量、纸张材质、暗青封面、半枚朱印、断线"
+                        "和水痕位置；允许变化的只有翻页状态、轻微折角和剧情明确造成的新"
+                        "污损，持有者变化必须有交接依据。"
+                    )
+                enriched_assets.append(
+                    {
+                        "id": item["id"],
+                        "kind": item["kind"],
+                        "name": item["name"],
+                        "description": description,
+                        "visualAnchor": visual_anchor,
+                        "continuityNotes": continuity,
+                    }
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {"assets": enriched_assets}, ensure_ascii=False
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
         if "七维描述" in request_payload["messages"][0]["content"]:
             if invalid_storyboard:
                 content = {"bad": True}
@@ -1273,6 +1382,28 @@ def test_project_lifecycle_persists(tmp_path: Path) -> None:
         assert client.get(
             f"/api/projects/{project['id']}/assets/batch-plan"
         ).json() is None
+
+        enriched_assets = client.post(
+            f"/api/projects/{project['id']}/assets/enrich",
+            json={"visualStandard": "live-action", "costumeEra": "auto"},
+        )
+        assert enriched_assets.status_code == 200
+        assert len(enriched_assets.json()["items"]) == len(asset_library["items"])
+        assert all(
+            len(item["description"]) >= 30
+            and len(item["visualAnchor"]) >= 80
+            and len(item["continuityNotes"]) >= 40
+            and item["status"] == "draft"
+            and item["promptStandardSignature"] == ""
+            for item in enriched_assets.json()["items"]
+        )
+        enriched_yun_zishu = next(
+            item
+            for item in enriched_assets.json()["items"]
+            if item["name"] == "云子姝"
+        )
+        assert "右眼尾浅痣" in enriched_yun_zishu["visualAnchor"]
+        assert enriched_yun_zishu["referenceImages"] == []
 
         editable_assets = {
             "items": asset_library["items"],

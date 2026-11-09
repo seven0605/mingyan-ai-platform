@@ -33,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from server.asset_card_generation import build_asset_card_messages
 from server.asset_tunnel import TemporaryAssetTunnel
 from server.credential_store import CredentialStore, SystemCredentialStore
 from server.script_planning import build_script_messages, extract_json_object
@@ -551,6 +552,28 @@ class AssetStandardSettings(BaseModel):
         "ming",
         "qing",
     ] = "auto"
+
+
+class AssetCardDraft(BaseModel):
+    id: str
+    kind: Literal["character", "scene", "prop"]
+    name: str
+    description: str = Field(min_length=30, max_length=2000)
+    visualAnchor: str = Field(min_length=80, max_length=4000)
+    continuityNotes: str = Field(min_length=40, max_length=3000)
+
+    @field_validator("id", "name", "description", "visualAnchor", "continuityNotes")
+    @classmethod
+    def strip_asset_card_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class AssetCardBatchResult(BaseModel):
+    assets: list[AssetCardDraft]
+
+
+class AssetCardEnrichmentOut(BaseModel):
+    items: list[AssetItem]
 
 
 ASSET_PROMPT_TEMPLATE_VERSION = "2026-11-04.8"
@@ -1878,6 +1901,19 @@ def storyboard_group_blueprints(episode: ScreenplayEpisode) -> list[dict]:
     return blueprints
 
 
+def unexpected_storyboard_characters(
+    text: str, known_characters: list[str], allowed_characters: list[str]
+) -> list[str]:
+    if not known_characters:
+        return []
+    character_pattern = "|".join(
+        re.escape(name)
+        for name in sorted(known_characters, key=len, reverse=True)
+    )
+    mentioned = set(re.findall(character_pattern, text))
+    return sorted(mentioned - set(allowed_characters))
+
+
 def validate_storyboard_structure(
     storyboard: StoryboardPayload,
     episode: ScreenplayEpisode,
@@ -1915,6 +1951,9 @@ def validate_storyboard_structure(
         "effects",
         "sound",
     )
+    known_characters = unique_strings(
+        [name for scene in episode.scenes for name in scene.characters]
+    )
     for group, blueprint in zip(storyboard.groups, blueprints, strict=True):
         for key in ("index", "sceneIndex", "startSeconds", "endSeconds", "durationSeconds"):
             if abs(float(getattr(group, key)) - float(blueprint[key])) > 0.01:
@@ -1927,6 +1966,39 @@ def validate_storyboard_structure(
             raise ValueError(f"第 {group.index} 组缺少完整的镜头、空间或提示词描述")
         if not group.segments:
             raise ValueError(f"第 {group.index} 组没有时间段")
+
+        group_text = "\n".join(
+            [
+                group.metadata,
+                group.sceneDescription,
+                group.firstFrameLock,
+                *group.subjects,
+                group.spatialRelations,
+                group.actionTimeline,
+                group.emotionalTurn,
+                group.keyDialogue,
+                group.videoPrompt,
+                *(
+                    value
+                    for segment in group.segments
+                    for value in (
+                        segment.action,
+                        segment.expression,
+                        segment.environment,
+                        segment.sound,
+                    )
+                ),
+            ]
+        )
+        unexpected_characters = unexpected_storyboard_characters(
+            group_text, known_characters, blueprint["characters"]
+        )
+        if unexpected_characters:
+            unexpected_names = "、".join(unexpected_characters)
+            raise ValueError(
+                f"第 {group.index} 组写入了本组未出镜人物："
+                f"{unexpected_names}"
+            )
 
         segment_cursor = 0.0
         for segment in group.segments:
@@ -2150,7 +2222,9 @@ def create_app(
             sync_service.flush()
             asset_tunnel.stop()
 
-    application = FastAPI(title="明琰AI平台本地服务", version="0.1.0", lifespan=lifespan)
+    application = FastAPI(
+        title="明琰AI平台本地服务", version="0.1.0-beta.2", lifespan=lifespan
+    )
 
     @application.middleware("http")
     async def track_sync_changes(request, call_next):
@@ -6240,6 +6314,136 @@ Chinese screenplay table, Markdown headings, or the SKILL text itself.
                 "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
             ).fetchone()
         return row_to_asset_library(saved)
+
+    @application.post(
+        "/api/projects/{project_id}/assets/enrich",
+        response_model=AssetCardEnrichmentOut,
+    )
+    def enrich_asset_library(
+        project_id: str, standard: AssetStandardSettings
+    ) -> AssetCardEnrichmentOut:
+        with connect(database_path) as connection:
+            project_row = connection.execute(
+                "SELECT name FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            screenplay_row = connection.execute(
+                "SELECT * FROM project_screenplays WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            library_row = connection.execute(
+                "SELECT * FROM project_assets WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        if project_row is None:
+            raise HTTPException(status_code=404, detail="项目不存在")
+        if screenplay_row is None or screenplay_row["status"] != "approved":
+            raise HTTPException(status_code=409, detail="请先完成人工确认剧本")
+        if library_row is None:
+            raise HTTPException(status_code=404, detail="请先从剧本整理资产")
+        if library_row["screenplay_updated_at"] != screenplay_row["updated_at"]:
+            raise HTTPException(status_code=409, detail="剧本已更新，请重新整理资产")
+
+        library = AssetLibraryPayload.model_validate(json.loads(library_row["payload"]))
+        screenplay = ScreenplayPayload.model_validate(
+            json.loads(screenplay_row["payload"])
+        )
+        settings, api_key = text_model_credentials()
+        chat_url = (
+            f"{settings.baseUrl}/chat/completions"
+            if settings.baseUrl.endswith("/v1")
+            else f"{settings.baseUrl}/v1/chat/completions"
+        )
+        drafts_by_id: dict[str, AssetCardDraft] = {}
+        kind_labels = {"character": "角色", "scene": "场景", "prop": "道具"}
+
+        for kind in ("character", "scene", "prop"):
+            items = [item for item in library.items if item.kind == kind]
+            if not items:
+                continue
+            messages = build_asset_card_messages(
+                project_row["name"],
+                standard.visualStandard,
+                standard.costumeEra,
+                [item.model_dump(mode="json") for item in items],
+                screenplay.model_dump(mode="json"),
+            )
+            try:
+                with httpx.Client(
+                    transport=model_transport, timeout=180, follow_redirects=True
+                ) as client:
+                    response = client.post(
+                        chat_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": settings.model,
+                            "messages": messages,
+                            "temperature": 0.15,
+                            "max_tokens": 8000,
+                        },
+                    )
+            except httpx.RequestError as error:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"{kind_labels[kind]}资产卡完善请求失败："
+                        f"{type(error).__name__}"
+                    ),
+                ) from error
+            if not response.is_success:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"模型服务返回 HTTP {response.status_code}，"
+                        f"{kind_labels[kind]}资产卡未更新"
+                    ),
+                )
+            try:
+                content = response.json()["choices"][0]["message"]["content"]
+                result = AssetCardBatchResult.model_validate(
+                    extract_json_object(content)
+                )
+            except (KeyError, IndexError, TypeError, ValueError, ValidationError) as error:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"模型返回的{kind_labels[kind]}资产卡结构不完整",
+                ) from error
+
+            requested = {item.id: item for item in items}
+            returned_ids = [draft.id for draft in result.assets]
+            if len(returned_ids) != len(set(returned_ids)) or set(returned_ids) != set(
+                requested
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"模型遗漏或重复了{kind_labels[kind]}资产",
+                )
+            for draft in result.assets:
+                source_item = requested[draft.id]
+                if draft.kind != source_item.kind or draft.name != source_item.name:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"模型改变了资产名称或类型：{source_item.name}",
+                    )
+                drafts_by_id[draft.id] = draft
+
+        enriched_items = []
+        for item in library.items:
+            draft = drafts_by_id.get(item.id)
+            if draft is None:
+                raise HTTPException(status_code=502, detail=f"模型遗漏资产：{item.name}")
+            enriched_items.append(
+                item.model_copy(
+                    update={
+                        "description": draft.description,
+                        "visualAnchor": draft.visualAnchor,
+                        "continuityNotes": draft.continuityNotes,
+                        "promptStandardSignature": "",
+                        "status": "draft",
+                    }
+                )
+            )
+        return AssetCardEnrichmentOut(items=enriched_items)
 
     @application.put(
         "/api/projects/{project_id}/assets", response_model=AssetLibraryOut

@@ -17,6 +17,8 @@ SYSTEM_PROMPT = """你是明琰AI平台的工业级AI视频分镜导演。
 8. 负面提示必须抑制人物漂移、服装漂移、空间跳变、肢体畸形、口型错位、穿模、闪烁和无依据新增角色。
 9. 只输出一个JSON对象，不要Markdown，不要解释。
 10. 本次可能只是整集中的一个小批次，只输出authoritativeGroupBlueprints列出的组，不得补写其他组；如提供styleBibleConstraint，styleBible必须保持该约束；如提供continuityContext，首组必须从该末帧状态顺接。
+11. authoritativeGroupBlueprints[].characters 是当前组唯一允许出镜的角色名单。不得因为角色出现在整集、其他场次、styleBibleConstraint 或 continuityContext 中，就把其写入当前组的 metadata、subjects、镜头、表演、声音或 videoPrompt。
+12. videoPrompt 开头的 [出镜角色-物品-场景] 只能列当前组 characters 中实际出镜的人；仅被提及、回忆、场外声或已离场的人不得列入。
 
 真人短剧V5导演规则（必须执行）：
 1. 每个10—15秒分镜组强制拆成5—7个微镜头，单镜2—4秒且不得超过5秒；不足10秒的尾组拆成3—4个微镜头。除非剧本明确要求一镜到底，不得用长镜头规避切镜。
@@ -89,11 +91,21 @@ def build_storyboard_messages(
     continuity_context: str = "",
     style_bible_constraint: str = "",
 ) -> list[dict[str, str]]:
+    batch_scene_indexes = {
+        blueprint.get("sceneIndex") for blueprint in blueprints
+    }
+    episode_context = dict(episode)
+    if isinstance(episode.get("scenes"), list):
+        episode_context["scenes"] = [
+            scene
+            for scene in episode["scenes"]
+            if scene.get("index") in batch_scene_indexes
+        ]
     payload = {
         "targetModel": target_model,
         "aspectRatio": aspect_ratio,
         "fps": fps,
-        "episode": episode,
+        "episode": episode_context,
         "authoritativeGroupBlueprints": blueprints,
         "continuityContext": continuity_context,
         "styleBibleConstraint": style_bible_constraint,
@@ -104,7 +116,9 @@ def build_storyboard_messages(
             "role": "user",
             "content": (
                 "请依据以下已确认剧本和权威分组蓝图生成完整分镜。"
-                "只输出本批蓝图对应的组；蓝图的数量、编号、场次和时间字段必须原样返回。\n"
+                "只输出本批蓝图对应的组；蓝图的数量、编号、场次和时间字段必须原样返回。"
+                "每组 characters 是该组唯一允许出镜的角色名单，"
+                "[出镜角色-物品-场景]以及其他所有字段都不得写入名单外人物。\n"
                 + json.dumps(payload, ensure_ascii=False)
             ),
         },

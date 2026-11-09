@@ -1,7 +1,9 @@
 import type {
   AssetTunnelStatus,
   AssetBatchPlan,
+  AssetItem,
   AssetLibrary,
+  AssetStandardSettings,
   ComfyUIVideoSettings,
   ImageModelSettings,
   Project,
@@ -341,6 +343,16 @@ export function resumeProjectTasks(projectId: string) {
 export function extractAssetLibrary(projectId: string) {
   return request<AssetLibrary>(`/api/projects/${projectId}/assets/extract`, {
     method: "POST",
+  });
+}
+
+export function enrichAssetLibrary(
+  projectId: string,
+  standard: AssetStandardSettings,
+) {
+  return request<{ items: AssetItem[] }>(`/api/projects/${projectId}/assets/enrich`, {
+    method: "POST",
+    body: JSON.stringify(standard),
   });
 }
 
