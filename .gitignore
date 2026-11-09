@@ -6,6 +6,8 @@
 __pycache__/
 .pytest_cache/
 dist/
+build/
+release/
 node_modules/
 *.log
 *.tsbuildinfo

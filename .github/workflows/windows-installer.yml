@@ -1,0 +1,141 @@
+name: windows-installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - ".github/workflows/windows-installer.yml"
+      - "packaging/**"
+      - "server/**"
+      - "src/**"
+      - "public/**"
+      - "index.html"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "vite.config.ts"
+      - "tsconfig*.json"
+
+permissions:
+  contents: write
+
+env:
+  APP_VERSION: 0.1.0-beta.1
+  APP_VERSION_NUM: 0.1.0.0
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: python -m pip install -r server/requirements-packaging.txt
+      - name: Build portable application
+        run: >-
+          pyinstaller --noconfirm --clean
+          --distpath build/windows/dist
+          --workpath build/windows/work
+          packaging/mingyan-ai.spec
+
+      - name: Smoke test portable application
+        shell: pwsh
+        run: |
+          $DataDir = Join-Path $env:RUNNER_TEMP "mingyan-portable-data"
+          $env:MINGYAN_DATA_DIR = $DataDir
+          $env:MINGYAN_NO_BROWSER = "1"
+          $env:MINGYAN_PORT = "8765"
+          $Process = Start-Process "build\windows\dist\MingyanAI\MingyanAI.exe" -PassThru
+          try {
+            $Ready = $false
+            for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
+              try {
+                $Health = Invoke-RestMethod "http://127.0.0.1:8765/api/health" -TimeoutSec 1
+                $Home = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/" -TimeoutSec 1
+                if ($Health.status -eq "ok" -and $Home.StatusCode -eq 200) {
+                  $Ready = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+            }
+            if (-not $Ready) { throw "Portable application failed its health check" }
+          } finally {
+            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Install NSIS
+        run: choco install nsis --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "build\windows\release" | Out-Null
+          $BuildDir = (Resolve-Path "build\windows\dist\MingyanAI").Path
+          $OutputFile = Join-Path $PWD "build\windows\release\MingyanAI-$env:APP_VERSION-Setup.exe"
+          $MakeNsis = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
+          & $MakeNsis "/DAPP_VERSION=$env:APP_VERSION" "/DAPP_VERSION_NUM=$env:APP_VERSION_NUM" "/DBUILD_DIR=$BuildDir" "/DOUTPUT_FILE=$OutputFile" "packaging\windows\installer.nsi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test installed application
+        shell: pwsh
+        run: |
+          $Installer = (Resolve-Path "build\windows\release\MingyanAI-$env:APP_VERSION-Setup.exe").Path
+          $InstallProcess = Start-Process $Installer -ArgumentList "/S" -Wait -PassThru
+          if ($InstallProcess.ExitCode -ne 0) { throw "Installer returned $($InstallProcess.ExitCode)" }
+          $InstalledExe = Join-Path $env:LOCALAPPDATA "Programs\MingyanAI\MingyanAI.exe"
+          if (-not (Test-Path $InstalledExe)) { throw "Installed executable was not found" }
+          $env:MINGYAN_DATA_DIR = Join-Path $env:RUNNER_TEMP "mingyan-installed-data"
+          $env:MINGYAN_NO_BROWSER = "1"
+          $env:MINGYAN_PORT = "8766"
+          $Process = Start-Process $InstalledExe -PassThru
+          try {
+            $Ready = $false
+            for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
+              try {
+                $Health = Invoke-RestMethod "http://127.0.0.1:8766/api/health" -TimeoutSec 1
+                if ($Health.status -eq "ok") {
+                  $Ready = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+            }
+            if (-not $Ready) { throw "Installed application failed its health check" }
+          } finally {
+            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+          }
+          $Uninstaller = Join-Path $env:LOCALAPPDATA "Programs\MingyanAI\Uninstall.exe"
+          $UninstallProcess = Start-Process $Uninstaller -ArgumentList "/S" -Wait -PassThru
+          if ($UninstallProcess.ExitCode -ne 0) { throw "Uninstaller returned $($UninstallProcess.ExitCode)" }
+          if (Test-Path $InstalledExe) { throw "Installed files were not removed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MingyanAI-${{ env.APP_VERSION }}-Windows
+          path: build/windows/release/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish prerelease
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $Installer = (Resolve-Path "build\windows\release\MingyanAI-$env:APP_VERSION-Setup.exe").Path
+          gh release create "${{ github.ref_name }}" $Installer --repo "${{ github.repository }}" --title "明琰AI平台 ${{ github.ref_name }}" --generate-notes --prerelease

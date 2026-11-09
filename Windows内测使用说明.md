@@ -4,13 +4,11 @@
 
 ## 一、首次安装
 
-1. 从 GitHub 下载项目 ZIP，并完整解压到一个普通文件夹。不要直接在压缩包预览窗口中运行。
-2. 安装 [Python 3.11 或更高版本](https://www.python.org/downloads/windows/)。安装时勾选 `Add Python to PATH`。
-3. 安装 [Node.js 22 LTS 或更高版本](https://nodejs.org/)。
-4. 双击 `安装依赖-Windows.cmd`，等待窗口显示“安装完成”。首次安装需要联网，可能需要数分钟。
-5. 双击 `启动明琰AI平台-Windows.cmd`。浏览器会自动打开 `http://127.0.0.1:8000/`。
+1. 从 GitHub Releases 下载 `MingyanAI-*-Setup.exe`。
+2. 双击安装包，按提示完成安装。内测版尚未购买数字签名，Windows 如显示来源提醒，请先核对下载地址确实来自本项目 GitHub Release。
+3. 双击桌面或开始菜单中的“明琰AI平台”。浏览器会自动打开 `http://127.0.0.1:8000/`。
 
-以后使用时只需执行第 5 步。
+以后使用时只需执行第 3 步。普通试用者不需要安装 Python、Node.js 或 Git。
 
 ## 二、首次配置
 

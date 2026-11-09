@@ -71,7 +71,9 @@
 
 ## Windows
 
-首次使用：双击 `安装依赖-Windows.cmd`。
+普通试用者优先从 GitHub Releases 下载 `MingyanAI-*-Setup.exe`。安装后通过桌面或开始菜单中的“明琰AI平台”启动，不需要单独安装 Python、Node.js 或 Git。
+
+从源码运行时，首次使用：双击 `安装依赖-Windows.cmd`。
 
 以后启动：双击 `启动明琰AI平台-Windows.cmd`。
 
